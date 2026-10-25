@@ -33,6 +33,7 @@ import * as EffectOutbox from "./EffectOutbox.ts";
 import * as EventStore from "./EventStore.ts";
 import * as ProjectionStore from "./ProjectionStore.ts";
 import * as ProjectStore from "./ProjectStore.ts";
+import * as ThreadAgentDefinitions from "./ThreadAgentDefinitions.ts";
 import * as TurnItemPositionStore from "./TurnItemPositionStore.ts";
 
 export class EventSinkWriteError extends Schema.TaggedError<EventSinkWriteError>()(
@@ -146,6 +147,9 @@ export interface EventSinkV2Shape {
       readonly effectTypes: ReadonlyArray<EffectOutbox.OrchestrationEffectRequestV2["type"]>;
       readonly reason: string;
     };
+    /** Written with the events, so a duplicate receipt or a rolled-back commit binds nothing. */
+    readonly agentDefinitionBinding?: ThreadAgentDefinitions.ThreadAgentDefinitionBinding;
+    readonly agentDefinitionCopy?: ThreadAgentDefinitions.ThreadAgentDefinitionCopy;
   }) => Effect.Effect<
     {
       readonly receipt: CommandReceiptStore.CommandReceiptV2;
@@ -207,6 +211,7 @@ const layerBase: Layer.Layer<
   | ProjectionStore.ProjectionStoreV2
   | ProjectStore.ProjectStoreV2
   | SqlClient.SqlClient
+  | ThreadAgentDefinitions.ThreadAgentDefinitions
   | TurnItemPositionStore.TurnItemPositionStoreV2
 > = Layer.effect(
   EventSinkV2,
@@ -217,6 +222,7 @@ const layerBase: Layer.Layer<
     const eventStore = yield* EventStore.EventStoreV2;
     const projectionStore = yield* ProjectionStore.ProjectionStoreV2;
     const projectStore = yield* ProjectStore.ProjectStoreV2;
+    const threadAgentDefinitions = yield* ThreadAgentDefinitions.ThreadAgentDefinitions;
     const turnItemPositions = yield* TurnItemPositionStore.TurnItemPositionStoreV2;
     const liveEvents = yield* PubSub.unbounded<OrchestrationV2StoredEvent>();
     const liveEventsByType = new Map<
@@ -663,6 +669,12 @@ const layerBase: Layer.Layer<
             );
           }
           const outcomes = yield* applyStoredEvents(storedEvents);
+          if (input.agentDefinitionBinding !== undefined) {
+            yield* threadAgentDefinitions.bind(input.agentDefinitionBinding);
+          }
+          if (input.agentDefinitionCopy !== undefined) {
+            yield* threadAgentDefinitions.copy(input.agentDefinitionCopy);
+          }
           yield* effectOutbox.enqueue(input.effects);
           const receipt: CommandReceiptStore.CommandReceiptV2 = {
             commandId: input.commandId,
@@ -1003,6 +1015,7 @@ export const layer: Layer.Layer<
       CommandReceiptStore.layer,
       EffectOutbox.layer,
       ProjectStore.layer,
+      ThreadAgentDefinitions.layer,
       TurnItemPositionStore.layer,
     ),
   ),

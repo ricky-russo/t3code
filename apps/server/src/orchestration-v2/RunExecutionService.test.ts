@@ -45,7 +45,9 @@ import * as ProviderAdapter from "@t3tools/provider-core/server/ProviderAdapter"
 import * as ProjectionStore from "./ProjectionStore.ts";
 import * as ProviderEventIngestor from "./ProviderEventIngestor.ts";
 import * as McpAppModelContext from "../mcpApps/McpAppModelContext.ts";
+import { t3AgentInstructionsBlock } from "@t3tools/provider-core/server/orchestrationInstructions";
 import * as RunExecutionService from "./RunExecutionService.ts";
+import * as ThreadAgentDefinitions from "./ThreadAgentDefinitions.ts";
 import * as RunFinalizationService from "./RunFinalizationService.ts";
 import * as TurnItemPositionStore from "./TurnItemPositionStore.ts";
 
@@ -64,6 +66,7 @@ const layerRunExecutionTest = RunExecutionService.layer.pipe(
   Layer.provide(
     Layer.mergeAll(
       McpAppModelContext.layerEmpty,
+      ThreadAgentDefinitions.layerEmpty,
       Layer.mock(CheckpointService.CheckpointServiceV2)({ captureBaseline: () => Effect.void }),
       layerTurnItemPositionsTest,
       Layer.mock(EventSink.EventSinkV2)({}),
@@ -877,6 +880,7 @@ it.effect("passes the thread's MCP app context to the provider under a safe key"
       RunExecutionService.layer.pipe(
         Layer.provide(
           Layer.mergeAll(
+            ThreadAgentDefinitions.layerEmpty,
             Layer.mock(McpAppModelContext.McpAppModelContext)({
               forThread: () =>
                 Effect.succeed([
@@ -905,6 +909,154 @@ it.effect("passes the thread's MCP app context to the provider under a safe key"
   ),
 );
 
+const reviewer = {
+  name: "reviewer",
+  path: "/repo/.claude/agents/reviewer.md",
+  instructions: "Check every changed line.",
+};
+
+const agentRunInput = (input: {
+  readonly key: string;
+  readonly ordinal: number;
+  readonly text: string;
+  readonly session: ProviderAdapter.ProviderAdapterV2SessionRuntime;
+}) => {
+  const threadId = ThreadId.make("thread:run-execution-agent");
+  const providerInstanceId = ProviderInstanceId.make("codex");
+  const attemptId = RunAttemptId.make(`attempt:${input.key}`);
+  return {
+    commandId: CommandId.make(`command:${input.key}`),
+    appThread: rootAppThread(threadId),
+    providerSessionId: ProviderSessionId.make("session:run-execution-agent"),
+    session: input.session,
+    run: {
+      id: RunId.make(`run:${input.key}`),
+      threadId,
+      ordinal: input.ordinal,
+      providerInstanceId,
+    } as OrchestrationV2Run,
+    rootNode: { id: NodeId.make(`node:${input.key}`) } as OrchestrationV2ExecutionNode,
+    checkpointScope: {
+      id: CheckpointScopeId.make(`checkpoint-scope:${input.key}`),
+    } as OrchestrationV2CheckpointScope,
+    providerThread: {
+      id: ProviderThreadId.make("provider-thread:run-execution-agent"),
+      driver,
+    } as OrchestrationV2ProviderThread,
+    attempt: { id: attemptId, providerTurnId: null } as OrchestrationV2RunAttempt,
+    attemptId,
+    providerTurnOrdinal: input.ordinal,
+    message: {
+      messageId: MessageId.make(`message:${input.key}`),
+      text: input.text,
+      attachments: [],
+      createdBy: "user" as const,
+      creationSource: "web" as const,
+    },
+    modelSelection: { instanceId: providerInstanceId, model: "gpt-5.4" },
+    runtimePolicy: {
+      runtimeMode: "full-access" as const,
+      interactionMode: "default" as const,
+      cwd: process.cwd(),
+    },
+  };
+};
+
+const layerAgentRunExecution = (
+  forThread: ThreadAgentDefinitions.ThreadAgentDefinitions["Service"]["forThread"],
+  eventSink: Partial<EventSink.EventSinkV2["Service"]> = {},
+) =>
+  RunExecutionService.layer.pipe(
+    Layer.provide(
+      Layer.mergeAll(
+        McpAppModelContext.layerEmpty,
+        Layer.mock(ThreadAgentDefinitions.ThreadAgentDefinitions)({ forThread }),
+        Layer.mock(CheckpointService.CheckpointServiceV2)({ captureBaseline: () => Effect.void }),
+        layerTurnItemPositionsTest,
+        Layer.mock(EventSink.EventSinkV2)(eventSink),
+        IdAllocator.layer,
+        Layer.mock(ProviderEventIngestor.ProviderEventIngestorV2)({
+          ingestNormalized: () => Effect.succeed([]),
+        }),
+        ServerSettings.layerTest(),
+      ),
+    ),
+  );
+
+it.effect("passes the thread's agent definition to every turn, including compaction", () =>
+  Effect.gen(function* () {
+    const inputs = yield* Ref.make<ReadonlyArray<ProviderAdapter.ProviderAdapterV2TurnInput>>([]);
+    const record = (input: ProviderAdapter.ProviderAdapterV2TurnInput) =>
+      Ref.update(inputs, (current) => [...current, input]);
+    const session = {
+      events: Stream.never,
+      startTurn: record,
+      compactThread: record,
+    } as unknown as ProviderAdapter.ProviderAdapterV2SessionRuntime;
+
+    yield* Effect.gen(function* () {
+      const runExecution = yield* RunExecutionService.RunExecutionServiceV2;
+      const turns = ["Review the diff.", "Keep going.", "/compact"];
+      for (const [index, text] of turns.entries()) {
+        yield* runExecution.startRootRun(
+          agentRunInput({ key: `run-execution-agent:${index}`, ordinal: index + 1, text, session }),
+        );
+      }
+    }).pipe(Effect.provide(layerAgentRunExecution(() => Effect.succeed(Option.some(reviewer)))));
+
+    const recorded = yield* Ref.get(inputs);
+    assert.deepEqual(
+      recorded.map((input) => input.agentInstructions),
+      [1, 2, 3].map(() => t3AgentInstructionsBlock(reviewer)),
+    );
+    assert.equal(recorded[2]?.message.text, "/compact");
+  }),
+);
+
+it.effect(
+  "fails the run without starting the provider when its agent definition cannot be read",
+  () =>
+    Effect.gen(function* () {
+      const providerStarts = yield* Ref.make(0);
+      const writes = yield* Ref.make<ReadonlyArray<OrchestrationV2DomainEvent>>([]);
+      const session = {
+        events: Stream.never,
+        startTurn: () => Ref.update(providerStarts, (count) => count + 1),
+      } as unknown as ProviderAdapter.ProviderAdapterV2SessionRuntime;
+
+      yield* Effect.gen(function* () {
+        const runExecution = yield* RunExecutionService.RunExecutionServiceV2;
+        yield* runExecution.startRootRun(
+          agentRunInput({ key: "run-execution-agent-read", ordinal: 1, text: "Start.", session }),
+        );
+      }).pipe(
+        Effect.provide(
+          layerAgentRunExecution(
+            () =>
+              Effect.fail(
+                new ThreadAgentDefinitions.ThreadAgentDefinitionsError({
+                  cause: "database unavailable",
+                }),
+              ),
+            {
+              writeIfRunCurrent: (input) =>
+                Ref.update(writes, (current) => [...current, ...input.events]).pipe(
+                  Effect.as({ committed: true, storedEvents: [] }),
+                ),
+            },
+          ),
+        ),
+      );
+
+      assert.equal(yield* Ref.get(providerStarts), 0);
+      const runUpdate = (yield* Ref.get(writes)).find((event) => event.type === "run.updated");
+      assert.equal(
+        runUpdate?.type === "run.updated" ? runUpdate.payload.status : undefined,
+        "failed",
+      );
+    }),
+);
+
 it.effect("fails the run when its ownership check cannot be read before calling the provider", () =>
   Effect.gen(function* () {
     const guardCalls = yield* Ref.make(0);
@@ -918,6 +1070,7 @@ it.effect("fails the run when its ownership check cannot be read before calling 
       Layer.provide(
         Layer.mergeAll(
           McpAppModelContext.layerEmpty,
+          ThreadAgentDefinitions.layerEmpty,
           Layer.mock(CheckpointService.CheckpointServiceV2)({ captureBaseline: () => Effect.void }),
           layerTurnItemPositionsTest,
           Layer.mock(EventSink.EventSinkV2)({
@@ -1119,6 +1272,7 @@ it.effect("starts the provider when checkpoint baseline capture fails", () =>
       Layer.provide(
         Layer.mergeAll(
           McpAppModelContext.layerEmpty,
+          ThreadAgentDefinitions.layerEmpty,
           Layer.mock(CheckpointService.CheckpointServiceV2)({
             captureBaseline: () =>
               Effect.fail(
@@ -1238,6 +1392,7 @@ it.effect.each(["failure", "interruption", "stale-attempt", "start-guard"] as co
         Layer.provide(
           Layer.mergeAll(
             McpAppModelContext.layerEmpty,
+            ThreadAgentDefinitions.layerEmpty,
             Layer.mock(CheckpointService.CheckpointServiceV2)({
               captureBaseline: () =>
                 scenario === "start-guard" ? Effect.void : Effect.die("not reached"),
@@ -1409,6 +1564,7 @@ it.effect("ingests new member threads of an owned child after the root turn term
       Layer.provide(
         Layer.mergeAll(
           McpAppModelContext.layerEmpty,
+          ThreadAgentDefinitions.layerEmpty,
           Layer.mock(CheckpointService.CheckpointServiceV2)({ captureBaseline: () => Effect.void }),
           layerTurnItemPositionsTest,
           Layer.mock(EventSink.EventSinkV2)({
@@ -1657,6 +1813,7 @@ it.effect("ends a nested native subagent and its thread when the root run is int
       Layer.provide(
         Layer.mergeAll(
           McpAppModelContext.layerEmpty,
+          ThreadAgentDefinitions.layerEmpty,
           Layer.mock(CheckpointService.CheckpointServiceV2)({ captureBaseline: () => Effect.void }),
           layerTurnItemPositionsTest,
           Layer.mock(EventSink.EventSinkV2)({
@@ -1959,6 +2116,7 @@ it.effect(
         Layer.provide(
           Layer.mergeAll(
             McpAppModelContext.layerEmpty,
+            ThreadAgentDefinitions.layerEmpty,
             Layer.mock(CheckpointService.CheckpointServiceV2)({
               captureBaseline: () => Effect.void,
             }),
@@ -2796,6 +2954,7 @@ function captureRootRunTermination(input: {
           Layer.mock(McpAppModelContext.McpAppModelContext)({
             forThread: () => input.appContext ?? Effect.succeed([]),
           }),
+          ThreadAgentDefinitions.layerEmpty,
           Layer.mock(CheckpointService.CheckpointServiceV2)({ captureBaseline: () => Effect.void }),
           layerTurnItemPositionsTest,
           Layer.mock(EventSink.EventSinkV2)({
@@ -3300,6 +3459,7 @@ function runBackgroundItemScenario(
       Layer.provide(
         Layer.mergeAll(
           McpAppModelContext.layerEmpty,
+          ThreadAgentDefinitions.layerEmpty,
           Layer.mock(CheckpointService.CheckpointServiceV2)({ captureBaseline: () => Effect.void }),
           layerTurnItemPositionsTest,
           Layer.mock(EventSink.EventSinkV2)({

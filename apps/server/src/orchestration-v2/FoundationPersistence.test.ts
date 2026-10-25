@@ -57,6 +57,7 @@ import * as ProjectionMaintenance from "./ProjectionMaintenance.ts";
 import * as ProjectionStore from "./ProjectionStore.ts";
 import * as ProjectStore from "./ProjectStore.ts";
 import * as ProviderRuntimeRecovery from "./ProviderRuntimeRecoveryService.ts";
+import * as ThreadAgentDefinitions from "./ThreadAgentDefinitions.ts";
 import * as TurnItemPositionStore from "./TurnItemPositionStore.ts";
 
 const isLiveStreamBufferError = Schema.is(LiveStreamBufferError);
@@ -3070,6 +3071,7 @@ it.effect("publishes live events in commit order across concurrent writers", () 
           layerPausingOutbox,
           layerCommandReceiptStoreProvided,
           ProjectStore.layer.pipe(Layer.provide(layerDatabase)),
+          ThreadAgentDefinitions.layer.pipe(Layer.provide(layerDatabase)),
           TurnItemPositionStore.layer.pipe(Layer.provide(layerDatabase)),
         ),
       ),
@@ -3337,6 +3339,7 @@ it.effect.each(["cancel transaction", "fail transaction", "cancel publication"] 
             layerPausingOutbox,
             layerCommandReceiptStoreProvided,
             ProjectStore.layer.pipe(Layer.provide(layerDatabase)),
+            ThreadAgentDefinitions.layer.pipe(Layer.provide(layerDatabase)),
             TurnItemPositionStore.layer.pipe(Layer.provide(layerDatabase)),
           ),
         ),

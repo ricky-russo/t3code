@@ -32,6 +32,7 @@ import * as Effect from "effect/Effect";
 import * as Exit from "effect/Exit";
 import * as Fiber from "effect/Fiber";
 import * as Layer from "effect/Layer";
+import * as Option from "effect/Option";
 import * as Ref from "effect/Ref";
 import * as Schedule from "effect/Schedule";
 import * as Schema from "effect/Schema";
@@ -42,8 +43,10 @@ import * as McpAppModelContext from "../mcpApps/McpAppModelContext.ts";
 import * as ServerSettings from "../serverSettings.ts";
 import * as CheckpointService from "./CheckpointService.ts";
 import * as EventSink from "./EventSink.ts";
+import * as ThreadAgentDefinitions from "./ThreadAgentDefinitions.ts";
 import * as IdAllocator from "@t3tools/provider-core/server/IdAllocator";
 import * as ProviderAdapter from "@t3tools/provider-core/server/ProviderAdapter";
+import { t3AgentInstructionsBlock } from "@t3tools/provider-core/server/orchestrationInstructions";
 import * as ProviderEventIngestor from "./ProviderEventIngestor.ts";
 import type { ProjectionStoreV2Error } from "./ProjectionStore.ts";
 import {
@@ -595,6 +598,7 @@ export const layer: Layer.Layer<
   | ProviderEventIngestor.ProviderEventIngestorV2
   | ServerSettings.ServerSettingsService
   | McpAppModelContext.McpAppModelContext
+  | ThreadAgentDefinitions.ThreadAgentDefinitions
   | TurnItemPositionStore.TurnItemPositionStoreV2
 > = Layer.effect(
   RunExecutionServiceV2,
@@ -606,6 +610,7 @@ export const layer: Layer.Layer<
     const providerEventIngestor = yield* ProviderEventIngestor.ProviderEventIngestorV2;
     const serverSettings = yield* ServerSettings.ServerSettingsService;
     const mcpAppModelContext = yield* McpAppModelContext.McpAppModelContext;
+    const threadAgentDefinitions = yield* ThreadAgentDefinitions.ThreadAgentDefinitions;
     const turnItemPositions = yield* TurnItemPositionStore.TurnItemPositionStoreV2;
     const finalizationObserver = yield* RunFinalizationService.RunFinalizationObserver;
 
@@ -1591,6 +1596,10 @@ export const layer: Layer.Layer<
           key: `mcp_app_${entry.itemId.replace(/[^\w.-]/g, "_")}`,
           text: entry.text,
         }));
+        // Unlike app context, a failed read fails every thread's start, agent or not, so a child never runs without its agent.
+        const agentDefinition = yield* Effect.exit(
+          threadAgentDefinitions.forThread(input.run.threadId),
+        );
         const turnInput = {
           appThread: input.appThread,
           threadId: input.run.threadId,
@@ -1627,18 +1636,26 @@ export const layer: Layer.Layer<
         const compact =
           input.message.attachments.length === 0 &&
           input.message.text.trim().toLowerCase() === "/compact";
-        const startTurn = compact
-          ? (input.session.compactThread?.(turnInput) ??
-            Effect.fail(
-              new ProviderAdapter.ProviderAdapterTurnStartError({
-                driver: input.session.driver,
-                threadId: input.run.threadId,
-                providerThreadId: input.providerThread.id,
-                runId: input.run.id,
-                cause: "This provider does not support context compaction.",
-              }),
-            ))
-          : input.session.startTurn(turnInput);
+        const startTurn = Effect.flatMap(agentDefinition, (definition) => {
+          const turnInputWithAgent = {
+            ...turnInput,
+            ...(Option.isSome(definition)
+              ? { agentInstructions: t3AgentInstructionsBlock(definition.value) }
+              : {}),
+          };
+          return compact
+            ? (input.session.compactThread?.(turnInputWithAgent) ??
+                Effect.fail(
+                  new ProviderAdapter.ProviderAdapterTurnStartError({
+                    driver: input.session.driver,
+                    threadId: input.run.threadId,
+                    providerThreadId: input.providerThread.id,
+                    runId: input.run.id,
+                    cause: "This provider does not support context compaction.",
+                  }),
+                ))
+            : input.session.startTurn(turnInputWithAgent);
+        });
         yield* Effect.andThen(shouldStart, startTurn).pipe(
           // Wait for acceptance so abandoned startup cannot leave a refresher
           // on the already-detached ingestion fiber.
@@ -1674,7 +1691,10 @@ export const layer: Layer.Layer<
                           terminal: makeFailedTerminalEvent(
                             makeProviderFailure({
                               cause: Cause.squash(cause),
-                              class: Exit.isFailure(shouldStart) ? "unknown" : "provider_error",
+                              class:
+                                Exit.isFailure(shouldStart) || Exit.isFailure(agentDefinition)
+                                  ? "unknown"
+                                  : "provider_error",
                             }),
                             latestItemOrdinal + 1,
                           ),

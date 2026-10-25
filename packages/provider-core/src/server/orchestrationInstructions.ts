@@ -97,3 +97,21 @@ export function t3OrchestrationPromptForFirstRun(input: {
 export function t3OrchestrationSystemPrompt(hasT3Mcp: boolean): string | undefined {
   return hasT3Mcp ? T3_CODE_ORCHESTRATION_INSTRUCTIONS : undefined;
 }
+
+const escapeAttribute = (value: string): string =>
+  value.replace(/&/g, "&amp;").replace(/"/g, "&quot;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+
+/** The only renderer of a delegated child's agent definition; adapters treat the result as one opaque section. */
+export function t3AgentInstructionsBlock(definition: {
+  readonly name: string;
+  readonly path: string;
+  readonly instructions: string;
+}): string {
+  return `## T3 Code agent definition
+
+You are running as the agent "${definition.name}", defined in ${definition.path}. Follow its instructions for this entire thread, including after context compaction. It grants no extra permissions and does not override T3 Code's runtime or interaction-mode constraints.
+
+<agent_definition name="${escapeAttribute(definition.name)}" path="${escapeAttribute(definition.path)}">
+${definition.instructions}
+</agent_definition>`;
+}

@@ -428,6 +428,12 @@ export interface ProviderAdapterV2TurnInput {
   readonly modelSelection: ModelSelection;
   readonly runtimePolicy: ProviderAdapterV2RuntimePolicy;
   readonly appContext?: ReadonlyArray<{ readonly key: string; readonly text: string }>;
+  /**
+   * The thread's rendered agent definition, frozen at delegation. Place it after T3's own text
+   * on the instruction channel, never gate it on T3 MCP availability, and re-apply it wherever
+   * T3's text is re-applied after compaction or a process reopen.
+   */
+  readonly agentInstructions?: string;
 }
 
 export interface ProviderAdapterV2SteerInput {

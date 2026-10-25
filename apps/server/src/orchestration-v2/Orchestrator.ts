@@ -159,6 +159,7 @@ import {
   ThreadForkServiceV2,
 } from "./ThreadForkService.ts";
 import { planThreadDeletion } from "./ThreadDeletion.ts";
+import type * as ThreadAgentDefinitions from "./ThreadAgentDefinitions.ts";
 import type * as ProviderAdapter from "@t3tools/provider-core/server/ProviderAdapter";
 import * as ServerSettings from "../serverSettings.ts";
 
@@ -7306,6 +7307,7 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
         occurredAt: now,
         payload: spawnTransfer,
       });
+      return childThreadId;
     },
   );
 
@@ -11554,6 +11556,8 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
         readonly effectTypes: ReadonlyArray<OrchestrationEffectRequestV2["type"]>;
         readonly reason: string;
       };
+      readonly agentDefinitionBinding?: ThreadAgentDefinitions.ThreadAgentDefinitionBinding;
+      readonly agentDefinitionCopy?: ThreadAgentDefinitions.ThreadAgentDefinitionCopy;
     },
     OrchestratorV2Error
   > {
@@ -11571,6 +11575,8 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
           readonly reason: string;
         }
       | undefined;
+    let agentDefinitionBinding: ThreadAgentDefinitions.ThreadAgentDefinitionBinding | undefined;
+    let agentDefinitionCopy: ThreadAgentDefinitions.ThreadAgentDefinitionCopy | undefined;
     switch (command.type) {
       case "thread.create":
         yield* dispatchThreadCreate(command, events);
@@ -11866,13 +11872,18 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
         break;
       case "thread.fork":
         yield* dispatchThreadFork(command, events);
+        agentDefinitionCopy = { from: command.sourceThreadId, to: command.targetThreadId };
         break;
       case "thread.merge_back":
         yield* dispatchThreadMergeBack(command, events);
         break;
-      case "delegated_task.request":
-        yield* dispatchDelegatedTaskRequest(command, events, effects);
+      case "delegated_task.request": {
+        const childThreadId = yield* dispatchDelegatedTaskRequest(command, events, effects);
+        if (command.agent !== undefined) {
+          agentDefinitionBinding = { threadId: childThreadId, definition: command.agent };
+        }
         break;
+      }
       case "delegated_task.wake-policy":
         yield* dispatchDelegatedTaskWakePolicy(command, events);
         break;
@@ -11893,6 +11904,8 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
       events: yield* Ref.get(events),
       effects: yield* Ref.get(effects),
       ...(cancelUnsettledEffects === undefined ? {} : { cancelUnsettledEffects }),
+      ...(agentDefinitionBinding === undefined ? {} : { agentDefinitionBinding }),
+      ...(agentDefinitionCopy === undefined ? {} : { agentDefinitionCopy }),
     };
   });
 
@@ -12070,6 +12083,12 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
         ...(plan.cancelUnsettledEffects === undefined
           ? {}
           : { cancelUnsettledEffects: plan.cancelUnsettledEffects }),
+        ...(plan.agentDefinitionBinding === undefined
+          ? {}
+          : { agentDefinitionBinding: plan.agentDefinitionBinding }),
+        ...(plan.agentDefinitionCopy === undefined
+          ? {}
+          : { agentDefinitionCopy: plan.agentDefinitionCopy }),
       })
       .pipe(
         Effect.mapError(

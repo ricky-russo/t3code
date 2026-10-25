@@ -2,6 +2,7 @@ import * as NodeServices from "@effect/platform-node/NodeServices";
 import { assert, describe, it } from "@effect/vitest";
 import {
   CommandId,
+  EventId,
   EnvironmentId,
   MessageId,
   NodeId,
@@ -30,12 +31,15 @@ import * as Option from "effect/Option";
 import * as Path from "effect/Path";
 import * as Ref from "effect/Ref";
 import * as Schema from "effect/Schema";
+import * as Stream from "effect/Stream";
 
 import { CodexProviderCapabilitiesV2 } from "../orchestration-v2/Adapters/CodexAdapterV2.ts";
 import * as CommandReceiptStore from "../orchestration-v2/CommandReceiptStore.ts";
 import * as LegacyV1ThreadImporter from "../orchestration-v2/legacy/LegacyV1ThreadImporter.ts";
+import * as EventSink from "../orchestration-v2/EventSink.ts";
 import * as Orchestrator from "../orchestration-v2/Orchestrator.ts";
 import * as ProviderReplayHarness from "../orchestration-v2/testkit/ProviderReplayHarness.ts";
+import * as ThreadAgentDefinitions from "../orchestration-v2/ThreadAgentDefinitions.ts";
 import * as SqlitePersistence from "../persistence/Sqlite.ts";
 import {
   DispatchModeLimit,
@@ -2183,6 +2187,7 @@ describe("OrchestratorMcpService provider resolution", () => {
           NodeServices.layer,
           layerRegistry,
           layerSettings,
+          ThreadAgentDefinitions.layer.pipe(Layer.provide(layerDatabase)),
           providerRegistryLayer([
             providerSnapshot({ instanceId: codexInstanceId, driver, model: "gpt-5.4" }),
           ]),
@@ -2247,6 +2252,8 @@ describe("OrchestratorMcpService provider resolution", () => {
         E,
         | OrchestratorMcpService.OrchestratorMcpService
         | Orchestrator.OrchestratorV2
+        | EventSink.EventSinkV2
+        | ThreadAgentDefinitions.ThreadAgentDefinitions
         | FileSystem.FileSystem
       >,
     ) =>
@@ -2256,6 +2263,115 @@ describe("OrchestratorMcpService provider resolution", () => {
           Effect.provideService(HostProcess.HomeDirectory, parent.home),
         );
       }).pipe(Effect.provide(layerTest));
+
+    it.effect("stores the agent definition with the delegation, for the child and its forks", () =>
+      run((parent) =>
+        Effect.gen(function* () {
+          const service = yield* OrchestratorMcpService.OrchestratorMcpService;
+          const orchestrator = yield* Orchestrator.OrchestratorV2;
+          const eventSink = yield* EventSink.EventSinkV2;
+          const definitions = yield* ThreadAgentDefinitions.ThreadAgentDefinitions;
+          const definitionPath = yield* parent.write(
+            "checkout/.claude/agents/reviewer.md",
+            "---\nname: reviewer\ndescription: Reviews diffs.\nmodel: opus\n---\n\nCheck every changed line.\n",
+          );
+          const result = yield* service.delegateTask(scope, {
+            task: "Review the diff.",
+            role: "review",
+            agent: "reviewer",
+            clientRequestId: "agents:review",
+          });
+
+          const brief = "Act as the review sub-agent for this task.\n\nReview the diff.";
+          const task = (yield* orchestrator.getThreadProjection(parentThreadId)).subagents.find(
+            (subagent) => subagent.id === result.taskId,
+          );
+          assert.equal(task?.prompt, brief);
+          const child = yield* orchestrator.getThreadProjection(result.childThreadId);
+          assert.equal(child.thread.title, brief);
+          assert.deepEqual(
+            child.messages.map((message) => ({ role: message.role, text: message.text })),
+            [{ role: "user", text: brief }],
+          );
+          const reviewer = {
+            name: "reviewer",
+            path: definitionPath,
+            instructions: "Check every changed line.",
+          };
+          assert.deepEqual(
+            yield* definitions.forThread(result.childThreadId),
+            Option.some(reviewer),
+          );
+          const throughSequence = yield* eventSink.latestSequence();
+          const storedEvents = yield* eventSink.stream().pipe(
+            Stream.takeUntil((event) => event.sequence >= throughSequence),
+            Stream.runCollect,
+          );
+          const published = JSON.stringify({
+            events: Array.from(storedEvents),
+            child,
+            subagents: (yield* orchestrator.getThreadProjection(parentThreadId)).subagents,
+          });
+          assert.include(published, "Review the diff.");
+          assert.notInclude(published, "Check every changed line.");
+
+          // A direct command behaves like the MCP path, and a grandchild never inherits.
+          const childRun = child.runs[0]!;
+          const delegate = (
+            commandId: string,
+            agent?: { name: string; path: string; instructions: string },
+          ) =>
+            orchestrator.dispatch({
+              type: "delegated_task.request",
+              createdBy: "agent",
+              creationSource: "mcp",
+              commandId: CommandId.make(commandId),
+              parentThreadId: result.childThreadId,
+              parentRunId: childRun.id,
+              parentNodeId: childRun.rootNodeId!,
+              task: "Help out.",
+              ...(agent === undefined ? {} : { agent }),
+              modelSelection: { instanceId: codexInstanceId, model: "gpt-5.4" },
+              runtimeMode: "full-access",
+              interactionMode: "default",
+            });
+          const helper = { name: "helper", path: "/elsewhere/helper.md", instructions: "Help." };
+          yield* delegate("agents:grandchild-helper", helper);
+          yield* delegate("agents:grandchild-plain");
+          const grandchildren = (yield* orchestrator.getThreadProjection(
+            result.childThreadId,
+          )).subagents.map((subagent) => subagent.childThreadId);
+          assert.lengthOf(grandchildren, 2);
+          assert.deepEqual(yield* definitions.forThread(grandchildren[0]!), Option.some(helper));
+          assert.deepEqual(yield* definitions.forThread(grandchildren[1]!), Option.none());
+
+          const completedAt = yield* DateTime.now;
+          yield* eventSink.write({
+            events: [
+              {
+                id: EventId.make("agents:child-run-completed"),
+                type: "run.updated",
+                threadId: result.childThreadId,
+                runId: childRun.id,
+                occurredAt: completedAt,
+                payload: { ...childRun, status: "completed", completedAt },
+              },
+            ],
+          });
+          const forkThreadId = ThreadId.make("thread:agents-fork");
+          yield* orchestrator.dispatch({
+            type: "thread.fork",
+            commandId: CommandId.make("agents:fork"),
+            sourceThreadId: result.childThreadId,
+            targetThreadId: forkThreadId,
+            sourcePoint: { type: "run", runId: childRun.id },
+            createdBy: "user",
+            creationSource: "web",
+          });
+          assert.deepEqual(yield* definitions.forThread(forkThreadId), Option.some(reviewer));
+        }),
+      ),
+    );
 
     it.effect("rejects an unknown agent without a child", () =>
       run((parent) =>
@@ -2277,6 +2393,43 @@ describe("OrchestratorMcpService provider resolution", () => {
             agent: "large",
           });
           assert.equal(accepted.status, "running");
+        }),
+      ),
+    );
+
+    it.effect("replays an accepted delegation after its agent file is deleted", () =>
+      run((parent) =>
+        Effect.gen(function* () {
+          const service = yield* OrchestratorMcpService.OrchestratorMcpService;
+          const fileSystem = yield* FileSystem.FileSystem;
+          const definitionPath = yield* parent.write(
+            "checkout/.agents/agents/reviewer.md",
+            "Review carefully.",
+          );
+          const request = {
+            task: "Review the diff.",
+            agent: "reviewer",
+            clientRequestId: "agents:retry",
+          };
+          const first = yield* service.delegateTask(scope, request);
+          yield* fileSystem.remove(definitionPath);
+
+          const retry = yield* service.delegateTask(scope, request);
+          assert.equal(retry.taskId, first.taskId);
+          assert.equal(retry.childThreadId, first.childThreadId);
+          const definitions = yield* ThreadAgentDefinitions.ThreadAgentDefinitions;
+          assert.deepEqual(
+            yield* definitions.forThread(first.childThreadId),
+            Option.some({
+              name: "reviewer",
+              path: definitionPath,
+              instructions: "Review carefully.",
+            }),
+          );
+          const fresh = yield* service
+            .delegateTask(scope, { ...request, clientRequestId: "agents:fresh" })
+            .pipe(Effect.flip);
+          assert.equal(fresh.code, "invalid_request");
         }),
       ),
     );
@@ -2313,6 +2466,59 @@ describe("OrchestratorMcpService provider resolution", () => {
             },
           });
           assert.deepEqual(capabilities.agents, [{ name: "helper", scope: "user" }]);
+        }),
+      ),
+    );
+
+    it.effect("delegates with the home's agents when the parent's project cannot be read", () =>
+      run((parent) =>
+        Effect.gen(function* () {
+          const service = yield* OrchestratorMcpService.OrchestratorMcpService;
+          const orchestrator = yield* Orchestrator.OrchestratorV2;
+          const definitions = yield* ThreadAgentDefinitions.ThreadAgentDefinitions;
+          const orphanThreadId = ThreadId.make("thread:agents-orphan");
+          yield* orchestrator.dispatch({
+            type: "thread.create",
+            createdBy: "user",
+            creationSource: "web",
+            commandId: CommandId.make("agents:orphan-create"),
+            threadId: orphanThreadId,
+            projectId: ProjectId.make("project:agents-gone"),
+            title: "Orphaned parent",
+            modelSelection: { instanceId: codexInstanceId, model: "gpt-5.4" },
+            runtimeMode: "full-access",
+            interactionMode: "default",
+            branch: null,
+            worktreePath: null,
+          });
+          yield* orchestrator.dispatch({
+            type: "message.dispatch",
+            createdBy: "user",
+            creationSource: "web",
+            commandId: CommandId.make("agents:orphan-start"),
+            threadId: orphanThreadId,
+            messageId: MessageId.make("agents:orphan-message"),
+            text: "Delegate a review.",
+            attachments: [],
+            dispatchMode: { type: "start_immediately" },
+          });
+          const helperPath = yield* parent.write("home/.claude/agents/helper.md", "Home helper.");
+
+          const result = yield* service.delegateTask(
+            {
+              ...scope,
+              thread: {
+                threadId: orphanThreadId,
+                providerSessionId: "provider-session:mcp-providers",
+                providerInstanceId: codexInstanceId,
+              },
+            },
+            { task: "Help out.", agent: "helper" },
+          );
+          assert.deepEqual(
+            yield* definitions.forThread(result.childThreadId),
+            Option.some({ name: "helper", path: helperPath, instructions: "Home helper." }),
+          );
         }),
       ),
     );
