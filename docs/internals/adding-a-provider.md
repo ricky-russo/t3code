@@ -45,6 +45,8 @@ capabilities, never the driver kind.
   MCP servers, run hooks, or launch a login. Keep heavier probes behind an explicit refresh.
 - **T3 MCP tools.** Inject the thread's MCP server so agents can use T3's tools, and make a turn
   survive when that server is unreachable.
+- **Agent instructions.** Place `agentInstructions` after T3's own text on the instruction channel,
+  never gate it on T3 MCP, and re-apply it wherever T3's text is re-applied.
 - **Updates.** Run an update only through the installer that provably owns the binary; otherwise
   leave it manual. See [`providerMaintenance.ts`](../../apps/server/src/provider/providerMaintenance.ts).
 

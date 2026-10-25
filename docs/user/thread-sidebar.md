@@ -236,6 +236,18 @@ Subagent threads started by the agent can't take messages; message the parent
 thread instead. When such a subagent needs an approval or an answer, the parent
 thread asks for it.
 
+The agent can start a subagent as a named agent definition, on any provider.
+Put a markdown file in `.agents/agents`, `.claude/agents`, or `.cursor/agents`,
+either in the project or in your home directory. The file name, without `.md`,
+names the agent, and a `name` in its frontmatter must match it. For a name
+defined twice, the project beats your home directory, and earlier folders in
+that list win. The body becomes the subagent's instructions for the whole
+thread, including after its context is compacted, and a fork of that thread
+keeps them. Later edits to the file do not reach a running subagent. Cursor and
+Muse receive the instructions once per session and can lose them to
+compaction. Fields such as `model` and `tools` are ignored, because the agent
+picks the provider and model when it delegates.
+
 Expand a tool call in the conversation to see its full command and output.
 Summaries shorten shell wrappers and can still describe the latest call after it
 finishes; the call's own result shows its status.

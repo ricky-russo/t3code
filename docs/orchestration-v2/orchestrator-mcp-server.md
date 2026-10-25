@@ -16,8 +16,9 @@ agent can use this endpoint to:
 
 These are T3 orchestration operations, not provider-native sub-agent APIs.
 Delegated tasks always create a T3 child thread and run. The child receives
-only the supplied task prompt, plus an optional role instruction supplied in
-the same tool call. Parent conversation history is not copied into the child.
+only the supplied task prompt, plus an optional role instruction and an optional
+[agent definition](#agent-definitions) named in the same tool call. Parent
+conversation history is not copied into the child.
 
 `ThreadManagementService` is the shared server application boundary for V2
 WebSocket commands and MCP. It owns thread lookup, listing, send-mode
@@ -201,7 +202,8 @@ Returns:
 - the inherited provider instance and model;
 - the parent runtime and interaction modes;
 - registered provider instances and advertised models;
-- whether each provider can run a child task; and
+- whether each provider can run a child task;
+- the agent definitions `delegate_task` accepts as `agent`; and
 - feature flags for polling, cancellation, and batch thread creation.
 
 Unavailable providers include model-visible constraints such as missing V2
@@ -214,6 +216,11 @@ models for Codex, Claude, Muse, and Grok, or the first 8 current models in the
 user's model order for other providers. `omittedModels` counts the rest, and the
 `search` input finds them, legacy models included. `delegate_task` still accepts
 any catalog model.
+
+`agents` follows the same rule: at most 20 definitions sorted by name, each with
+its name, scope, and description clipped to 300 characters, never its body.
+`omittedAgents` counts the rest, and `search` filters agents by name and
+description.
 
 ### `delegate_task`
 
@@ -230,6 +237,7 @@ type DelegateTaskInput = {
   };
   title?: string;
   role?: "implementation" | "research" | "review" | "design" | "test" | "general";
+  agent?: string;
   mode?: "async" | "wait";
   timeoutMs?: number;
   clientRequestId?: string;
@@ -264,6 +272,30 @@ published result.
 Delegation requires an active parent run owned by the MCP credential's
 provider session. The request becomes the V2 command
 `delegated_task.request`.
+
+#### Agent definitions
+
+`agent` names a markdown file in `.agents/agents`, `.claude/agents`, or
+`.cursor/agents`, searched in the parent's checkout and then in the home
+directory. The first folder that has the name wins.
+
+- The name is the file stem. A frontmatter `name`, when present, must match it.
+  A winner that is unreadable, malformed, misnamed, empty, or over 64 KiB
+  returns `invalid_request` rather than falling through to a lower folder.
+- Only `description` and the body are honored. `target` and the runtime modes
+  choose the model, tools, and permissions, so frontmatter `model` and `tools`
+  are ignored.
+- The definition is frozen on the command, so a retry replays it without
+  reading the file. It is stored in `thread_agent_definitions` in the
+  delegation's own commit. That table is authoritative state, not a projection.
+  The body is never event-sourced or streamed, and projection rebuilds must not
+  purge it.
+- A fork copies its source's definition. A grandchild gets one only when its
+  own `delegate_task` names an agent.
+- Adapters deliver it as `ProviderAdapterV2TurnInput.agentInstructions` on
+  their instruction channel. Cursor and Muse have none, so they get it once per
+  native session and can lose it to compaction. ACP sends it again after a
+  reported compaction.
 
 `mode: "async"` returns the current durable state immediately.
 `mode: "wait"` waits for the task result, including nested work and completion follow-ups, or until
