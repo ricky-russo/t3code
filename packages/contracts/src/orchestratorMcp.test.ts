@@ -66,4 +66,11 @@ describe("orchestrator MCP contracts", () => {
       }),
     ).toThrow();
   });
+
+  it("trims a delegated agent name and rejects one longer than 128 characters", () => {
+    const input = { task: "Review the diff." };
+    expect(decodeDelegateTaskInput({ ...input, agent: "  reviewer  " }).agent).toBe("reviewer");
+    expect(decodeDelegateTaskInput(input).agent).toBeUndefined();
+    expect(() => decodeDelegateTaskInput({ ...input, agent: "a".repeat(129) })).toThrow();
+  });
 });

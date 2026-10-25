@@ -2718,6 +2718,32 @@ export const OrchestrationV2StoredEventJson = Schema.Struct({
 });
 export type OrchestrationV2StoredEventJson = typeof OrchestrationV2StoredEventJson.Type;
 
+export const DELEGATED_AGENT_INSTRUCTIONS_MAX_BYTES = 64 * 1024;
+export const DELEGATED_AGENT_NAME_MAX_LENGTH = 128;
+
+export function utf8ByteLength(value: string): number {
+  let bytes = 0;
+  for (const character of value) {
+    const codePoint = character.codePointAt(0) ?? 0;
+    bytes += codePoint < 0x80 ? 1 : codePoint < 0x800 ? 2 : codePoint < 0x10000 ? 3 : 4;
+  }
+  return bytes;
+}
+
+// The command is client-dispatchable, so the file cap is enforced again at decode.
+const isWithinDelegatedAgentInstructionBytes = Schema.makeFilter(
+  (value: string) => utf8ByteLength(value) <= DELEGATED_AGENT_INSTRUCTIONS_MAX_BYTES,
+  { expected: `at most ${DELEGATED_AGENT_INSTRUCTIONS_MAX_BYTES} UTF-8 bytes` },
+);
+
+// Resolved before dispatch and frozen in the command, so a retry replays the same definition.
+export const OrchestrationV2DelegatedAgent = Schema.Struct({
+  name: TrimmedNonEmptyString.check(Schema.isMaxLength(DELEGATED_AGENT_NAME_MAX_LENGTH)),
+  path: TrimmedNonEmptyString,
+  instructions: TrimmedNonEmptyString.check(isWithinDelegatedAgentInstructionBytes),
+});
+export type OrchestrationV2DelegatedAgent = typeof OrchestrationV2DelegatedAgent.Type;
+
 export const OrchestrationV2Command = Schema.Union([
   Schema.Struct({
     type: Schema.Literal("thread.stop"),
@@ -3136,6 +3162,7 @@ export const OrchestrationV2Command = Schema.Union([
     parentRunId: RunId,
     parentNodeId: NodeId,
     task: TrimmedNonEmptyString,
+    agent: Schema.optional(OrchestrationV2DelegatedAgent),
     title: Schema.optional(TrimmedNonEmptyString),
     modelSelection: ModelSelection,
     runtimeMode: RuntimeMode,

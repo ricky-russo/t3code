@@ -21,9 +21,13 @@ import {
   type ServerProvider,
 } from "@t3tools/contracts";
 import { checkpointWorkspace } from "@t3tools/provider-testing/replayWorkspace";
+import * as HostProcess from "@t3tools/shared/HostProcess";
 import * as DateTime from "effect/DateTime";
 import * as Effect from "effect/Effect";
+import * as FileSystem from "effect/FileSystem";
 import * as Layer from "effect/Layer";
+import * as Option from "effect/Option";
+import * as Path from "effect/Path";
 import * as Ref from "effect/Ref";
 import * as Schema from "effect/Schema";
 
@@ -53,14 +57,18 @@ import * as ServerSettings from "../serverSettings.ts";
 import * as SecretRequests from "../secrets/SecretRequests.ts";
 import type { McpInvocationScope } from "./McpInvocationContext.ts";
 import { idleThreadProjection, liveThreadShell } from "./McpToolAccess.testkit.ts";
+import * as AgentDefinitions from "./AgentDefinitions.ts";
 import * as OrchestratorMcpService from "./OrchestratorMcpService.ts";
 import type * as ProviderAdapter from "@t3tools/provider-core/server/ProviderAdapter";
 
 const decodeTarget = Schema.decodeUnknownEffect(OrchestratorMcpTarget);
 
-const layerOrchestratorService = OrchestratorMcpService.layer.pipe(
+const layerOrchestratorServiceWithoutAgents = OrchestratorMcpService.layer.pipe(
   Layer.provide(Layer.mock(ThreadLaunchService.ThreadLaunchService)({})),
   Layer.provide(Layer.mock(GitVcsDriver.GitVcsDriver)({})),
+);
+const layerOrchestratorService = layerOrchestratorServiceWithoutAgents.pipe(
+  Layer.provide(Layer.mock(AgentDefinitions.AgentDefinitions)({ list: () => Effect.succeed([]) })),
 );
 
 describe("OrchestratorMcpService", () => {
@@ -1085,6 +1093,7 @@ describe("OrchestratorMcpService provider resolution", () => {
         modelSelection,
         runtimeMode: "full-access",
         interactionMode: "default",
+        worktreePath: "/repo",
       },
       runs: [
         {
@@ -2134,6 +2143,216 @@ describe("OrchestratorMcpService provider resolution", () => {
         }
       }),
   );
+
+  describe("agent definitions", () => {
+    const driver = ProviderDriverKind.make("codex");
+    const layerRegistry = ProviderAdapterRegistry.layerFromAdapters([
+      {
+        instanceId: codexInstanceId,
+        driver,
+        getCapabilities: () => Effect.succeed(CodexProviderCapabilitiesV2),
+        planSelectionTransition: () => Effect.succeed({ type: "apply_on_next_turn" as const }),
+        openSession: () =>
+          Effect.die("These tests exercise committed commands before provider execution."),
+      },
+    ]);
+    const layerDatabase = SqlitePersistence.layerMemory;
+    const layerOrchestrator = ProviderReplayHarness.layerWithRegistry(
+      { name: "mcp-agent-definitions" },
+      layerRegistry,
+      { databaseLayer: layerDatabase, runEffectWorker: false },
+    );
+    const layerSettings = ServerSettings.layerTest();
+    const layerTest = layerOrchestratorServiceWithoutAgents.pipe(
+      Layer.provide(AgentDefinitions.layer),
+      Layer.provideMerge(
+        ThreadManagementService.layer.pipe(
+          Layer.provideMerge(layerOrchestrator),
+          Layer.provide(
+            LegacyV1ThreadImporter.layer.pipe(
+              Layer.provide(layerOrchestrator),
+              Layer.provide(layerDatabase),
+            ),
+          ),
+          Layer.provide(CommandReceiptStore.layer.pipe(Layer.provide(layerDatabase))),
+          Layer.provide(layerSettings),
+        ),
+      ),
+      Layer.provideMerge(
+        Layer.mergeAll(
+          NodeServices.layer,
+          layerRegistry,
+          layerSettings,
+          providerRegistryLayer([
+            providerSnapshot({ instanceId: codexInstanceId, driver, model: "gpt-5.4" }),
+          ]),
+          // Every project lookup misses, so a parent without a worktree has no checkout to scan.
+          Layer.mock(ProjectService.ProjectService)({
+            getById: () => Effect.succeed(Option.none()),
+          }),
+          Layer.mock(SecretRequests.SecretRequests)({}),
+          Layer.mock(ScheduledTaskService.ScheduledTaskService)({}),
+        ),
+      ),
+    );
+
+    const startParent = Effect.fn("test.startParent")(function* () {
+      const fileSystem = yield* FileSystem.FileSystem;
+      const path = yield* Path.Path;
+      const orchestrator = yield* Orchestrator.OrchestratorV2;
+      const root = yield* fileSystem.realPath(
+        yield* fileSystem.makeTempDirectoryScoped({ prefix: "t3-mcp-agents-" }),
+      );
+      const checkout = path.join(root, "checkout");
+      yield* fileSystem.makeDirectory(checkout, { recursive: true });
+      yield* orchestrator.dispatch({
+        type: "thread.create",
+        createdBy: "user",
+        creationSource: "web",
+        commandId: CommandId.make("agents:parent-create"),
+        threadId: parentThreadId,
+        projectId,
+        title: "MCP parent",
+        modelSelection: { instanceId: codexInstanceId, model: "gpt-5.4" },
+        runtimeMode: "full-access",
+        interactionMode: "default",
+        branch: null,
+        worktreePath: checkout,
+      });
+      yield* orchestrator.dispatch({
+        type: "message.dispatch",
+        createdBy: "user",
+        creationSource: "web",
+        commandId: CommandId.make("agents:parent-start"),
+        threadId: parentThreadId,
+        messageId: MessageId.make("agents:parent-message"),
+        text: "Delegate a review.",
+        attachments: [],
+        dispatchMode: { type: "start_immediately" },
+      });
+      const write = Effect.fn("test.write")(function* (relativePath: string, contents: string) {
+        const filePath = path.join(root, relativePath);
+        yield* fileSystem.makeDirectory(path.dirname(filePath), { recursive: true });
+        yield* fileSystem.writeFileString(filePath, contents);
+        return filePath;
+      });
+      return { home: path.join(root, "home"), write };
+    });
+
+    const run = <A, E>(
+      body: (
+        parent: Effect.Success<ReturnType<typeof startParent>>,
+      ) => Effect.Effect<
+        A,
+        E,
+        | OrchestratorMcpService.OrchestratorMcpService
+        | Orchestrator.OrchestratorV2
+        | FileSystem.FileSystem
+      >,
+    ) =>
+      Effect.gen(function* () {
+        const parent = yield* startParent();
+        return yield* body(parent).pipe(
+          Effect.provideService(HostProcess.HomeDirectory, parent.home),
+        );
+      }).pipe(Effect.provide(layerTest));
+
+    it.effect("rejects an unknown agent without a child", () =>
+      run((parent) =>
+        Effect.gen(function* () {
+          const service = yield* OrchestratorMcpService.OrchestratorMcpService;
+          const orchestrator = yield* Orchestrator.OrchestratorV2;
+          yield* parent.write("home/.cursor/agents/helper.md", "Help.");
+          yield* parent.write("home/.cursor/agents/large.md", "x".repeat(60_000));
+
+          const unknown = yield* service
+            .delegateTask(scope, { task: "Review.", agent: "reviewer" })
+            .pipe(Effect.flip);
+          assert.equal(unknown.code, "invalid_request");
+          assert.include(unknown.message, "Known: helper, large.");
+          assert.deepEqual((yield* orchestrator.getThreadProjection(parentThreadId)).subagents, []);
+
+          const accepted = yield* service.delegateTask(scope, {
+            task: "y".repeat(100_000),
+            agent: "large",
+          });
+          assert.equal(accepted.status, "running");
+        }),
+      ),
+    );
+
+    it.effect("lists only the home's agents when the parent's project cannot be read", () =>
+      run((parent) =>
+        Effect.gen(function* () {
+          const service = yield* OrchestratorMcpService.OrchestratorMcpService;
+          const orchestrator = yield* Orchestrator.OrchestratorV2;
+          const orphanThreadId = ThreadId.make("thread:agents-orphan");
+          yield* orchestrator.dispatch({
+            type: "thread.create",
+            createdBy: "user",
+            creationSource: "web",
+            commandId: CommandId.make("agents:orphan-create"),
+            threadId: orphanThreadId,
+            projectId: ProjectId.make("project:agents-gone"),
+            title: "Orphaned parent",
+            modelSelection: { instanceId: codexInstanceId, model: "gpt-5.4" },
+            runtimeMode: "full-access",
+            interactionMode: "default",
+            branch: null,
+            worktreePath: null,
+          });
+          yield* parent.write("checkout/.claude/agents/local.md", "Project agent.");
+          yield* parent.write("home/.claude/agents/helper.md", "Home helper.");
+
+          const capabilities = yield* service.capabilities({
+            ...scope,
+            thread: {
+              threadId: orphanThreadId,
+              providerSessionId: "provider-session:mcp-providers",
+              providerInstanceId: codexInstanceId,
+            },
+          });
+          assert.deepEqual(capabilities.agents, [{ name: "helper", scope: "user" }]);
+        }),
+      ),
+    );
+
+    it.effect("lists the parent checkout's and home's agents, capped and searchable", () =>
+      run((parent) =>
+        Effect.gen(function* () {
+          const service = yield* OrchestratorMcpService.OrchestratorMcpService;
+          yield* parent.write(
+            "checkout/.agents/agents/reviewer.md",
+            `---\ndescription: ${"Reviews diffs. ".repeat(30)}\n---\nReview.`,
+          );
+          yield* parent.write("checkout/.claude/agents/helper.md", "Project helper.");
+          yield* parent.write("home/.claude/agents/helper.md", "Home helper.");
+          for (let index = 1; index <= 20; index += 1) {
+            yield* parent.write(
+              `home/.cursor/agents/worker-${String(index).padStart(2, "0")}.md`,
+              "Work.",
+            );
+          }
+
+          const capabilities = yield* service.capabilities(scope);
+          assert.equal(capabilities.agents.length, 20);
+          assert.equal(capabilities.omittedAgents, 2);
+          assert.deepEqual(capabilities.agents[0], { name: "helper", scope: "project" });
+          assert.equal(capabilities.agents.at(-1)?.name, "worker-18");
+
+          const searched = yield* service.capabilities(scope, { search: "DIFFS" });
+          assert.isUndefined(searched.omittedAgents);
+          assert.deepEqual(searched.agents, [
+            {
+              name: "reviewer",
+              description: `${"Reviews diffs. ".repeat(30).trim().slice(0, 297)}...`,
+              scope: "project",
+            },
+          ]);
+        }),
+      ),
+    );
+  });
 
   describe("scheduled tasks at modes above the caller's", () => {
     const projectId = ProjectId.make("project:scheduled");

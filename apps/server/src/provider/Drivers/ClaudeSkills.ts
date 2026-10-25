@@ -7,8 +7,8 @@ import * as Schema from "effect/Schema";
 import * as HostProcess from "@t3tools/shared/HostProcess";
 import { parseCliArgs } from "@t3tools/shared/cliArgs";
 import { fromLenientJson } from "@t3tools/shared/schemaJson";
+import { splitMarkdownFrontmatter } from "@t3tools/shared/markdownFrontmatter";
 import { SKILL_MENTION_PATTERN } from "@t3tools/shared/composerInlineTokens";
-import { parse as parseYamlDocument } from "yaml";
 
 import { expandHomePath } from "@t3tools/provider-core/server/pathExpansion";
 
@@ -20,10 +20,8 @@ type ClaudeSkillRoot = {
   readonly prefix?: string;
 };
 
-const FRONTMATTER_PATTERN = /^---\r?\n([\s\S]*?)\r?\n---(?:\r?\n|$)/;
-
 type SkillFrontmatter =
-  | { readonly kind: "missing" }
+  | { readonly kind: "none" }
   | { readonly kind: "malformed" }
   | {
       readonly kind: "parsed";
@@ -57,38 +55,12 @@ function parseFrontmatterBoolean(value: unknown): boolean | undefined {
 }
 
 function parseSkillFrontmatter(contents: string): SkillFrontmatter {
-  const match = FRONTMATTER_PATTERN.exec(contents);
-  if (!match) {
-    return { kind: "missing" };
+  const frontmatter = splitMarkdownFrontmatter(contents);
+  if (frontmatter.kind !== "parsed") {
+    return { kind: frontmatter.kind };
   }
 
-  const frontmatter = match[1] ?? "";
-  let parsed: unknown;
-  try {
-    parsed = parseYamlDocument(frontmatter);
-  } catch {
-    // Repair Claude's accepted ': ' scalars without disturbing comments or YAML structure.
-    const repaired = frontmatter.replace(
-      /^([\w-]+:[ \t]*)([^\r\n]*)/gm,
-      (line, prefix: string, value: string) => {
-        const scalar = value.split(/[ \t]+#/)[0] ?? "";
-        if (!/:[ \t]/.test(scalar) || /^(?:["'[\]{}|>&*!#%@`]|[-?:](?:[ \t]|$))/.test(scalar)) {
-          return line;
-        }
-        return `${prefix}${JSON.stringify(scalar)}${value.slice(scalar.length)}`;
-      },
-    );
-    try {
-      parsed = parseYamlDocument(repaired);
-    } catch {
-      return { kind: "malformed" };
-    }
-  }
-  if (typeof parsed !== "object" || parsed === null) {
-    return { kind: "malformed" };
-  }
-
-  const record = parsed as Record<string, unknown>;
+  const record = frontmatter.fields;
   const name = typeof record.name === "string" ? record.name.trim() : "";
   const description = typeof record.description === "string" ? record.description.trim() : "";
   return {

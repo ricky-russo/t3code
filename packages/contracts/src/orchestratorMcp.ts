@@ -32,6 +32,7 @@ import {
 } from "./threadPullRequest.ts";
 import { ThreadTitleRegeneration } from "./threadTitle.ts";
 import {
+  DELEGATED_AGENT_NAME_MAX_LENGTH,
   OrchestrationV2Actor,
   OrchestrationV2CreationSource,
   OrchestrationV2RunStatus,
@@ -149,6 +150,12 @@ export const OrchestratorMcpDelegateTaskInput = Schema.Struct({
   target: Schema.optional(OrchestratorMcpTarget),
   title: Schema.optional(OrchestratorMcpTitle),
   role: Schema.optional(OrchestratorMcpTaskRole),
+  agent: Schema.optional(
+    TrimmedNonEmptyString.check(Schema.isMaxLength(DELEGATED_AGENT_NAME_MAX_LENGTH)).annotate({
+      description:
+        "Agent definition name from `orchestrator_capabilities.agents`. The child runs under its instructions for the whole thread.",
+    }),
+  ),
   isolation: Schema.optional(
     Schema.Literals(["shared", "worktree"]).annotate({
       description:
@@ -512,7 +519,8 @@ export type OrchestratorMcpThreadInterruptResult = typeof OrchestratorMcpThreadI
 export const OrchestratorMcpCapabilitiesInput = Schema.Struct({
   search: Schema.optional(
     TrimmedNonEmptyString.check(Schema.isMaxLength(200)).annotate({
-      description: "Match model ids and labels. Replaces the short list.",
+      description:
+        "Match model ids and labels, and agent names and descriptions. Replaces the short lists.",
     }),
   ),
 });
@@ -546,6 +554,13 @@ export const OrchestratorMcpProviderCapability = Schema.Struct({
 });
 export type OrchestratorMcpProviderCapability = typeof OrchestratorMcpProviderCapability.Type;
 
+export const OrchestratorMcpAgentSummary = Schema.Struct({
+  name: Schema.String,
+  description: Schema.optional(Schema.String),
+  scope: Schema.Literals(["project", "user"]),
+});
+export type OrchestratorMcpAgentSummary = typeof OrchestratorMcpAgentSummary.Type;
+
 export const OrchestratorMcpCapabilitiesResult = Schema.Struct({
   parentThreadId: Schema.NullOr(ThreadId),
   inheritedProviderInstanceId: Schema.NullOr(ProviderInstanceId),
@@ -554,6 +569,10 @@ export const OrchestratorMcpCapabilitiesResult = Schema.Struct({
   runtimeMode: RuntimeMode,
   interactionMode: ProviderInteractionMode,
   providers: Schema.Array(OrchestratorMcpProviderCapability),
+  /** Agent definitions `delegate_task` accepts as `agent`, from the caller's checkout and home. */
+  agents: Schema.Array(OrchestratorMcpAgentSummary),
+  /** Agents left out of `agents`: matches past the cap. */
+  omittedAgents: Schema.optional(NonNegativeInt),
   features: Schema.Struct({
     appOwnedSubagents: Schema.Boolean,
     asyncPolling: Schema.Boolean,

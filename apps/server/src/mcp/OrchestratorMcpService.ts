@@ -14,6 +14,7 @@ import {
   type OrchestrationV2ThreadLaunchWorkspaceStrategy,
   type OrchestrationV2TurnItem,
   OrchestratorMcpFailure,
+  type OrchestratorMcpAgentSummary,
   type OrchestratorMcpCapabilitiesInput,
   type OrchestratorMcpCapabilitiesResult,
   type OrchestratorMcpModelOption,
@@ -113,6 +114,7 @@ import {
 } from "./McpInvocationContext.ts";
 import * as Metrics from "../observability/Metrics.ts";
 import * as SecretRequests from "../secrets/SecretRequests.ts";
+import * as AgentDefinitions from "./AgentDefinitions.ts";
 
 const DEFAULT_WAIT_TIMEOUT_MS = 10 * 60 * 1_000;
 const MAX_WAIT_TIMEOUT_MS = 60 * 60 * 1_000;
@@ -349,6 +351,35 @@ function listCapabilityModels(input: {
   );
   const listed = visible.filter((model) => input.isPinned(model) || shown.has(model));
   return { listed, omitted: visible.length - listed.length };
+}
+
+const LISTED_AGENT_LIMIT = 20;
+const AGENT_DESCRIPTION_MAX_CHARS = 300;
+
+/** Every call lands in the agent's context, so list the first few by name, or the first few matches. */
+function listCapabilityAgents(
+  definitions: ReadonlyArray<AgentDefinitions.AgentDefinition>,
+  searchTerms: ReadonlyArray<string>,
+) {
+  const matches = definitions.filter((definition) => {
+    const text = `${definition.name} ${definition.description ?? ""}`.toLowerCase();
+    return searchTerms.every((term) => text.includes(term));
+  });
+  const listed = matches
+    .slice(0, LISTED_AGENT_LIMIT)
+    .map(({ name, description, scope }): OrchestratorMcpAgentSummary => ({
+      name,
+      ...(description === undefined
+        ? {}
+        : {
+            description:
+              description.length > AGENT_DESCRIPTION_MAX_CHARS
+                ? `${description.slice(0, AGENT_DESCRIPTION_MAX_CHARS - 3)}...`
+                : description,
+          }),
+      scope,
+    }));
+  return { listed, omitted: matches.length - listed.length };
 }
 
 /** Option ids and allowed values are all a delegating agent needs; labels are UI copy. */
@@ -1062,6 +1093,7 @@ const make = Effect.gen(function* () {
   const threadLaunch = yield* ThreadLaunchService.ThreadLaunchService;
   const gitDriver = yield* GitVcsDriver.GitVcsDriver;
   const serverSettings = yield* ServerSettings.ServerSettingsService;
+  const agentDefinitions = yield* AgentDefinitions.AgentDefinitions;
 
   const requireProject = (projectId: ProjectId) =>
     projects.getById(projectId).pipe(
@@ -1076,6 +1108,22 @@ const make = Effect.gen(function* () {
         }),
       ),
     );
+
+  // Read from the parent's checkout, which holds uncommitted definitions a worktree child lacks.
+  const agentDefinitionsCwd = Effect.fn("OrchestratorMcpService.agentDefinitionsCwd")(function* (
+    thread:
+      | Pick<OrchestrationV2ThreadProjection["thread"], "worktreePath" | "projectId">
+      | undefined,
+  ) {
+    if (thread === undefined) return undefined;
+    return (
+      thread.worktreePath ??
+      (yield* requireProject(thread.projectId).pipe(
+        Effect.map((project) => project.workspaceRoot),
+        Effect.orElseSucceed(() => undefined),
+      ))
+    );
+  });
 
   const projectDefaultModelSelection = (
     project: Effect.Success<ReturnType<typeof requireProject>>,
@@ -2073,6 +2121,10 @@ const make = Effect.gen(function* () {
       );
       const inherited = parent?.thread.modelSelection;
       const searchTerms = input.search?.toLowerCase().split(/\s+/) ?? [];
+      const agents = listCapabilityAgents(
+        yield* agentDefinitions.list({ cwd: yield* agentDefinitionsCwd(parent?.thread) }),
+        searchTerms,
+      );
       return {
         parentThreadId: parent?.thread.id ?? null,
         inheritedProviderInstanceId: inherited?.instanceId ?? null,
@@ -2121,6 +2173,8 @@ const make = Effect.gen(function* () {
             constraints: [...constraints],
           };
         }),
+        agents: agents.listed,
+        ...(agents.omitted === 0 ? {} : { omittedAgents: agents.omitted }),
         features: {
           appOwnedSubagents: true,
           asyncPolling: true,
@@ -2171,6 +2225,17 @@ const make = Effect.gen(function* () {
         parent.thread.interactionMode,
         input.interactionMode,
       );
+      const task = taskPrompt(input);
+      // An accepted delegation replays its frozen command, so a retry skips the file.
+      const agent =
+        input.agent === undefined || isRetryOfAcceptedDelegation
+          ? undefined
+          : yield* agentDefinitions
+              .resolve({ cwd: yield* agentDefinitionsCwd(parent.thread), name: input.agent })
+              .pipe(
+                Effect.mapError((error) => failure("invalid_request", error.message)),
+                Effect.map(({ name, path, instructions }) => ({ name, path, instructions })),
+              );
       let workspaceStrategy: OrchestrationV2ThreadLaunchWorkspaceStrategy | undefined;
       if (input.isolation === "worktree" && !isRetryOfAcceptedDelegation) {
         const project = yield* requireProject(parent.thread.projectId);
@@ -2213,7 +2278,8 @@ const make = Effect.gen(function* () {
           parentThreadId: scope.thread.threadId,
           parentRunId: parentRun.id,
           parentNodeId: parentRun.rootNodeId,
-          task: taskPrompt(input),
+          task,
+          ...(agent === undefined ? {} : { agent }),
           ...(input.title === undefined ? {} : { title: input.title }),
           modelSelection: target.modelSelection,
           runtimeMode,
@@ -2963,4 +3029,5 @@ export const layer: Layer.Layer<
   | ProjectService.ProjectService
   | SecretRequests.SecretRequests
   | ServerSettings.ServerSettingsService
+  | AgentDefinitions.AgentDefinitions
 > = Layer.effect(OrchestratorMcpService, make);

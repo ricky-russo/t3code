@@ -5,6 +5,7 @@ import * as Schema from "effect/Schema";
 import { NodeId, RunAttemptId, TrimmedNonEmptyString } from "./index.ts";
 import {
   latestProviderTurnForAttempt,
+  OrchestrationV2DelegatedAgent,
   OrchestrationV2ProviderCapabilities,
   OrchestrationV2ProviderThread,
   OrchestrationV2ProviderThreadJson,
@@ -628,5 +629,22 @@ describe("latestProviderTurnForAttempt", () => {
     ];
     expect(latestProviderTurnForAttempt(turns, RunAttemptId.make("goal-attempt"))?.id).toBe("last");
     expect(latestProviderTurnForAttempt(turns, null)).toBeUndefined();
+  });
+});
+
+describe("OrchestrationV2DelegatedAgent", () => {
+  const decode = Schema.decodeUnknownSync(OrchestrationV2DelegatedAgent);
+  const agent = { name: "reviewer", path: "/repo/.claude/agents/reviewer.md" };
+
+  it("bounds the name at 128 characters and the instructions at 64 KiB of UTF-8", () => {
+    expect(decode({ ...agent, name: "a".repeat(128), instructions: "Review." }).name).toHaveLength(
+      128,
+    );
+    expect(() => decode({ ...agent, name: "a".repeat(129), instructions: "Review." })).toThrow();
+    const fourByteCharacters = "🦊".repeat(16 * 1024);
+    expect(decode({ ...agent, instructions: fourByteCharacters }).instructions).toBe(
+      fourByteCharacters,
+    );
+    expect(() => decode({ ...agent, instructions: `${fourByteCharacters}x` })).toThrow();
   });
 });
