@@ -1032,6 +1032,8 @@ interface ActiveAcpTurn {
   readonly user: ActiveTextStream;
   readonly assistant: ActiveTextStream;
   readonly reasoning: ActiveTextStream;
+  /** What an echo of each submitted text block shows: the user's text, never the adapter's instructions. */
+  readonly promptEcho: ReadonlyMap<string, ReadonlyArray<string>>;
   providerRetry?:
     | {
         readonly failure: OrchestrationV2ProviderFailure;
@@ -4893,6 +4895,11 @@ export const makeAcpAdapterV2 = Effect.fn("makeAcpAdapterV2")(function* (
               if (update.content === undefined) break;
               const text = (update.content ?? [])
                 .flatMap((content) => {
+                  const echoed =
+                    update.sessionUpdate === "user_message" && content.type === "text"
+                      ? context.promptEcho.get(content.text)
+                      : undefined;
+                  if (echoed !== undefined) return echoed;
                   const display = acpContentBlockDisplayText(content);
                   return display === undefined ? [] : [display];
                 })
@@ -7091,6 +7098,9 @@ export const makeAcpAdapterV2 = Effect.fn("makeAcpAdapterV2")(function* (
           const instructionState = {
             interactionMode: turnInput.runtimePolicy.interactionMode,
             hasT3Mcp: (yield* readMcpContext(turnInput.threadId)).servers.length > 0,
+            ...(turnInput.agentInstructions === undefined
+              ? {}
+              : { agentInstructions: turnInput.agentInstructions }),
           } satisfies T3AcpInstructionState;
           const previousInstructionState = (yield* Ref.get(promptInstructionStates)).get(sessionId);
           const compactionMarker = (yield* Ref.get(compactionMarkers)).get(sessionId);
@@ -7161,17 +7171,21 @@ export const makeAcpAdapterV2 = Effect.fn("makeAcpAdapterV2")(function* (
               detail: "ACP turn requires non-empty text or attachments",
             });
           }
-          if (!isNativeSlashCommand) {
-            prompt.push({
-              type: "text",
-              text: buildRuntimeInstructions({
+          const runtimeInstructions = isNativeSlashCommand
+            ? undefined
+            : buildRuntimeInstructions({
                 harness: flavor.runtimeHarness ?? driver,
                 model: turnInput.modelSelection.model,
-              }),
-            });
+              });
+          if (runtimeInstructions !== undefined) {
+            prompt.push({ type: "text", text: runtimeInstructions });
           }
           return {
             prompt,
+            promptEcho: new Map<string, ReadonlyArray<string>>([
+              [text, [messageText]],
+              ...(runtimeInstructions === undefined ? [] : [[runtimeInstructions, []] as const]),
+            ]),
             instructionState: text === messageText ? undefined : instructionState,
             compactionMarker,
           };
@@ -7318,6 +7332,7 @@ export const makeAcpAdapterV2 = Effect.fn("makeAcpAdapterV2")(function* (
               user: { current: null, nextSegment: 0 },
               assistant: { current: null, nextSegment: 0 },
               reasoning: { current: null, nextSegment: 0 },
+              promptEcho: promptParts?.promptEcho ?? new Map(),
               contextUsage: rememberedContextUsage ?? turnInput.providerThread.contextUsage ?? null,
               nativeMetadata: initialNativeMetadata,
               tools: new Map(),

@@ -1,6 +1,9 @@
 import { assert, it } from "@effect/vitest";
 
-import { t3AgentInstructionsBlock } from "./orchestrationInstructions.ts";
+import {
+  t3AcpPromptWithInstructions,
+  t3AgentInstructionsBlock,
+} from "./orchestrationInstructions.ts";
 
 it("renders the agent definition with escaped attributes and a verbatim body", () => {
   const instructions =
@@ -21,4 +24,23 @@ it("renders the agent definition with escaped attributes and a verbatim body", (
       `<agent_definition name="say &quot;hi&quot; &lt;now&gt;" path="/repo/.claude/agents/reviewer.md">\n${instructions}\n</agent_definition>`,
     ),
   );
+});
+
+it("sends the agent definition to ACP agents without T3 MCP and skips it once the state is unchanged", () => {
+  const agentInstructions = t3AgentInstructionsBlock({
+    name: "reviewer",
+    path: "/repo/.claude/agents/reviewer.md",
+    instructions: "Check every changed line.",
+  });
+  const state = { interactionMode: "default" as const, hasT3Mcp: false, agentInstructions };
+  const first = t3AcpPromptWithInstructions({ prompt: "Review the diff.", state });
+  assert.include(first, "T3 Code interaction mode: Default");
+  assert.notInclude(first, "## T3 Code orchestration");
+  assert.include(first, `${agentInstructions}\n</t3_code_instructions>`);
+  assert.include(first, "<user_request>\nReview the diff.\n</user_request>");
+  assert.equal(
+    t3AcpPromptWithInstructions({ prompt: "Keep going.", state, previousState: state }),
+    "Keep going.",
+  );
+  assert.equal(t3AcpPromptWithInstructions({ prompt: "/compact", state }), "/compact");
 });

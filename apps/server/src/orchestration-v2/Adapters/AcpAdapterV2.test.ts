@@ -72,6 +72,7 @@ import {
 import * as IdAllocator from "@t3tools/provider-core/server/IdAllocator";
 import * as ProviderAdapter from "@t3tools/provider-core/server/ProviderAdapter";
 import { makeTurnInput } from "./AcpAdapterV2.testkit.ts";
+import { t3AgentInstructionsBlock } from "@t3tools/provider-core/server/orchestrationInstructions";
 import type * as ProviderContinuationRequests from "@t3tools/provider-core/server/ProviderContinuationRequests";
 import {
   AcpProviderCapabilitiesV2,
@@ -306,6 +307,7 @@ const pollProtocolMethods = (events: Queue.Queue<EffectAcpProtocol.AcpProtocolLo
 
 const makeInstructionCompactionHarness = Effect.fnUntraced(function* (
   environment: Readonly<Record<string, string>>,
+  agentInstructions?: string,
 ) {
   const childProcessSpawner = yield* ChildProcessSpawner.ChildProcessSpawner;
   const path = yield* Path.Path;
@@ -362,8 +364,8 @@ const makeInstructionCompactionHarness = Effect.fnUntraced(function* (
   const now = yield* DateTime.now;
   let ordinal = 0;
   return Effect.fnUntraced(function* (messageText: string, expectedStatus = "completed") {
-    yield* runtime.startTurn(
-      makeTurnInput({
+    yield* runtime.startTurn({
+      ...makeTurnInput({
         threadId,
         providerThread,
         instanceId,
@@ -372,7 +374,8 @@ const makeInstructionCompactionHarness = Effect.fnUntraced(function* (
         ordinal: ++ordinal,
         messageText,
       }),
-    );
+      ...(agentInstructions === undefined ? {} : { agentInstructions }),
+    });
     const terminal = yield* runtime.events.pipe(
       Stream.filter((event) => event.type === "turn.terminal"),
       Stream.runHead,
@@ -390,13 +393,21 @@ const makeInstructionCompactionHarness = Effect.fnUntraced(function* (
 function assertReinjectedInstructions(
   blocks: Array<{ type: "text"; text: string }>,
   request: string,
+  agentInstructions?: string,
 ) {
   const text = blocks[0]?.text ?? "";
   assert.include(text, "T3 Code interaction mode: Default");
   assert.include(text, "## T3 Code browser");
   assert.include(text, "T3 Code orchestration");
+  if (agentInstructions !== undefined) assert.include(text, agentInstructions);
   assert.include(text, `<user_request>\n${request}\n</user_request>`);
 }
+
+const ACP_TEST_AGENT_INSTRUCTIONS = t3AgentInstructionsBlock({
+  name: "reviewer",
+  path: "/repo/.claude/agents/reviewer.md",
+  instructions: "Check every changed line before you answer.",
+});
 
 describe("AcpAdapterV2", () => {
   it.live.each(["details", "none"] as const)(
@@ -1010,25 +1021,117 @@ describe("AcpAdapterV2", () => {
     }).pipe(Effect.provide(layerTest), Effect.scoped),
   );
 
+  it.live("publishes only the user's text when the agent echoes a wrapped prompt", () =>
+    Effect.gen(function* () {
+      const childProcessSpawner = yield* ChildProcessSpawner.ChildProcessSpawner;
+      const path = yield* Path.Path;
+      const selfInvocation = yield* resolveSelfInvocation();
+      const mockAgentPath = yield* path.fromFileUrl(
+        new URL("../../../scripts/acp-mock-agent.ts", import.meta.url),
+      );
+      const instanceId = ProviderInstanceId.make("acp-test-prompt-echo");
+      const threadId = ThreadId.make("thread-acp-prompt-echo");
+      yield* (yield* McpProviderSessions.McpProviderSessions).set({
+        environmentId: EnvironmentId.make("environment-acp-prompt-echo"),
+        threadId,
+        providerSessionId: "mcp-session-acp-prompt-echo",
+        providerInstanceId: instanceId,
+        endpoint: "http://127.0.0.1:43123/mcp",
+        authorizationHeader: "Bearer prompt-echo-token",
+        browserToolsAvailable: true,
+      });
+      const adapter = yield* makeAcpAdapterV2({
+        instanceId,
+        flavor: {
+          driver: ACP_TEST_DRIVER,
+          capabilities: AcpProviderCapabilitiesV2,
+          makeRuntime: makeMockRuntime({
+            childProcessSpawner,
+            mockAgentPath,
+            environment: { T3_ACP_ECHO_PROMPT: "1" },
+          }),
+        },
+        selfInvocation,
+      });
+      const runtimePolicy = ProviderAdapter.ProviderAdapterV2RuntimePolicy.make({
+        runtimeMode: "full-access",
+        interactionMode: "default",
+        cwd: process.cwd(),
+      });
+      const modelSelection = { instanceId, model: "default" } as const;
+      const runtime = yield* adapter.openSession({
+        threadId,
+        providerSessionId: ProviderSessionId.make("provider-session-acp-prompt-echo"),
+        modelSelection,
+        runtimePolicy,
+      });
+      const providerThread = yield* runtime.ensureThread({
+        threadId,
+        modelSelection,
+        runtimePolicy,
+      });
+      yield* runtime.startTurn({
+        ...makeTurnInput({
+          threadId,
+          providerThread,
+          instanceId,
+          runtimePolicy,
+          now: yield* DateTime.now,
+          messageText: "Review the diff.",
+        }),
+        agentInstructions: ACP_TEST_AGENT_INSTRUCTIONS,
+      });
+      const events = Array.from(
+        yield* runtime.events.pipe(
+          Stream.takeUntil((event) => event.type === "turn.terminal"),
+          Stream.runCollect,
+        ),
+      );
+
+      const userTexts = events.flatMap((event) =>
+        event.type === "message.updated" && event.message.role === "user"
+          ? [event.message.text]
+          : event.type === "turn_item.updated" && event.turnItem.type === "user_message"
+            ? [event.turnItem.text]
+            : [],
+      );
+      assert.isNotEmpty(userTexts);
+      for (const text of userTexts) assert.equal(text, "Review the diff.");
+      const published = JSON.stringify(events);
+      assert.notInclude(published, "Check every changed line before you answer.");
+      assert.notInclude(published, "t3_code_instructions");
+    }).pipe(Effect.provide(layerTest), Effect.scoped),
+  );
+
   it.live(
     "reinjects ACP instructions after protocol compaction, including during reinjection",
     () =>
       Effect.gen(function* () {
-        const runTurn = yield* makeInstructionCompactionHarness({
-          T3_ACP_COMPACTION_PROMPT_ORDINALS: "2,4",
-        });
-        yield* runTurn("Start work.");
-        yield* runTurn("Continue until context compacts.");
+        const runTurn = yield* makeInstructionCompactionHarness(
+          { T3_ACP_COMPACTION_PROMPT_ORDINALS: "2,4" },
+          ACP_TEST_AGENT_INSTRUCTIONS,
+        );
+        assertReinjectedInstructions(
+          yield* runTurn("Start work."),
+          "Start work.",
+          ACP_TEST_AGENT_INSTRUCTIONS,
+        );
+        assert.equal(
+          (yield* runTurn("Continue until context compacts."))[0]?.text,
+          "Continue until context compacts.",
+        );
         assert.deepEqual(yield* runTurn("  /repro-skill"), [
           { type: "text", text: "  /repro-skill" },
         ]);
         assertReinjectedInstructions(
           yield* runTurn("Continue after compaction."),
           "Continue after compaction.",
+          ACP_TEST_AGENT_INSTRUCTIONS,
         );
         assertReinjectedInstructions(
           yield* runTurn("Continue after the second compaction."),
           "Continue after the second compaction.",
+          ACP_TEST_AGENT_INSTRUCTIONS,
         );
         assert.equal((yield* runTurn("Finish work."))[0]?.text, "Finish work.");
       }).pipe(Effect.provide(layerTest), Effect.scoped),
