@@ -98,7 +98,10 @@ import { resolveAttachmentPath, resolveAttachmentPathById } from "../../attachme
 import { getCodexServiceTierOptionValue } from "../../codexModelOptions.ts";
 import { ServerConfig } from "../../config.ts";
 import { expandHomePath } from "@t3tools/provider-core/server/pathExpansion";
-import { buildCodexAdditionalContext } from "../../provider/CodexDeveloperInstructions.ts";
+import {
+  buildCodexAdditionalContext,
+  codexAgentInstructionEntries,
+} from "../../provider/CodexDeveloperInstructions.ts";
 import {
   describeMcpElicitation,
   toMcpElicitationResponse,
@@ -722,6 +725,49 @@ function codexRuntimeModeTurnDefaults(runtimeMode: RuntimeMode): {
   }
 }
 
+const codexSelectedReasoningEffort = (modelSelection: ModelSelection) =>
+  getModelSelectionStringOptionValue(modelSelection, "reasoningEffort") ??
+  codexDefaultReasoningEffortOverride(modelSelection.model);
+
+interface CodexTurnContextInput {
+  readonly hasT3Mcp: boolean;
+  readonly browserToolsAvailable: boolean;
+  readonly deviceToolsAvailable: boolean;
+  readonly appContext?: ProviderAdapter.ProviderAdapterV2TurnInput["appContext"];
+  readonly agentInstructions?: string;
+}
+
+/** The additionalContext half of turn/start, shared with compaction so a reopened process restores it too. */
+function codexTurnAdditionalContext(
+  input: CodexTurnContextInput & { readonly modelSelection: ModelSelection },
+): CodexTurnStartParamsWithCollaborationMode["additionalContext"] | undefined {
+  // MCP-written app context must be quoted user input, not developer instructions.
+  const appContext = Object.fromEntries(
+    (input.appContext ?? []).map((entry) => [
+      entry.key,
+      { kind: "untrusted" as const, value: entry.text },
+    ]),
+  );
+  const t3Context = input.hasT3Mcp
+    ? buildCodexAdditionalContext(
+        {
+          model: input.modelSelection.model,
+          reasoningEffort: codexSelectedReasoningEffort(input.modelSelection),
+        },
+        { browser: input.browserToolsAvailable, device: input.deviceToolsAvailable },
+      )
+    : undefined;
+  const agentContext =
+    input.agentInstructions === undefined
+      ? undefined
+      : codexAgentInstructionEntries(input.agentInstructions);
+  return t3Context === undefined &&
+    agentContext === undefined &&
+    Object.keys(appContext).length === 0
+    ? undefined
+    : { ...t3Context, ...agentContext, ...appContext };
+}
+
 export const buildCodexTurnStartParams = Effect.fn("CodexAdapterV2.buildCodexTurnStartParams")(
   function* (input: {
     readonly nativeThreadId: string;
@@ -734,6 +780,7 @@ export const buildCodexTurnStartParams = Effect.fn("CodexAdapterV2.buildCodexTur
     /** ChatGPT token sharing does not accept service tiers. */
     readonly omitServiceTier?: boolean;
     readonly appContext?: ProviderAdapter.ProviderAdapterV2TurnInput["appContext"];
+    readonly agentInstructions?: string;
   }) {
     const runtimeModeDefaults = codexRuntimeModeTurnDefaults(input.runtimePolicy.runtimeMode);
     const approvalPolicy =
@@ -744,36 +791,23 @@ export const buildCodexTurnStartParams = Effect.fn("CodexAdapterV2.buildCodexTur
       input.runtimePolicy.sandboxPolicy === undefined
         ? runtimeModeDefaults.sandboxPolicy
         : yield* decodeTurnSandboxPolicy(input.runtimePolicy.sandboxPolicy);
-    const selectedEffort =
-      getModelSelectionStringOptionValue(input.modelSelection, "reasoningEffort") ??
-      codexDefaultReasoningEffortOverride(input.modelSelection.model);
+    const selectedEffort = codexSelectedReasoningEffort(input.modelSelection);
     const effort =
       selectedEffort === undefined ? undefined : yield* decodeTurnReasoningEffort(selectedEffort);
     const serviceTier =
       input.omitServiceTier === true
         ? undefined
         : getCodexServiceTierOptionValue(input.modelSelection);
-    // MCP-written app context must be quoted user input, not developer instructions.
-    const appContext = Object.fromEntries(
-      (input.appContext ?? []).map((entry) => [
-        entry.key,
-        { kind: "untrusted" as const, value: entry.text },
-      ]),
-    );
-    const t3Context =
-      input.hasT3Mcp === true
-        ? buildCodexAdditionalContext(
-            { model: input.modelSelection.model, reasoningEffort: effort ?? undefined },
-            {
-              browser: input.browserToolsAvailable ?? true,
-              device: input.deviceToolsAvailable ?? false,
-            },
-          )
-        : undefined;
-    const additionalContext =
-      t3Context === undefined && Object.keys(appContext).length === 0
-        ? undefined
-        : { ...t3Context, ...appContext };
+    const additionalContext = codexTurnAdditionalContext({
+      modelSelection: input.modelSelection,
+      hasT3Mcp: input.hasT3Mcp === true,
+      browserToolsAvailable: input.browserToolsAvailable ?? true,
+      deviceToolsAvailable: input.deviceToolsAvailable ?? false,
+      ...(input.appContext === undefined ? {} : { appContext: input.appContext }),
+      ...(input.agentInstructions === undefined
+        ? {}
+        : { agentInstructions: input.agentInstructions }),
+    });
     return yield* decodeCodexTurnStartParamsWithCollaborationMode({
       threadId: input.nativeThreadId,
       input: input.codexInput,
@@ -1774,6 +1808,30 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
             }),
           ),
         );
+        const turnContextInputs = Effect.fn("CodexAdapterV2.turnContextInputs")(function* (
+          turnInput: ProviderAdapter.ProviderAdapterV2TurnInput,
+        ): Effect.fn.Return<CodexTurnContextInput> {
+          const mcpSession = yield* mcpSessions.read(turnInput.threadId);
+          return {
+            hasT3Mcp: mcpSession !== undefined,
+            browserToolsAvailable: mcpSession?.browserToolsAvailable ?? true,
+            deviceToolsAvailable: mcpSession?.capabilities?.has("device") ?? false,
+            ...(turnInput.appContext === undefined ? {} : { appContext: turnInput.appContext }),
+            ...(turnInput.agentInstructions === undefined
+              ? {}
+              : { agentInstructions: turnInput.agentInstructions }),
+          };
+        });
+        const rememberAdditionalContext = (
+          threadId: string,
+          context: CodexTurnStartParamsWithCollaborationMode["additionalContext"] | undefined,
+        ) =>
+          Ref.update(additionalContextByThread, (current) => {
+            const next = new Map(current);
+            if (context) next.set(threadId, context);
+            else next.delete(threadId);
+            return next;
+          });
         const initialized = yield* Ref.make(false);
         // Codex rejects a second initialize on the shared app-server.
         const initializePermit = yield* Semaphore.make(1);
@@ -6319,30 +6377,20 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
             codexInput: ReadonlyArray<CodexSchema.V2TurnStartParams__UserInput>,
           ) {
             const threadId = yield* getNativeThreadId(turnInput.providerThread);
-            const mcpSession = yield* mcpSessions.read(turnInput.threadId);
             const turnStartParams = yield* buildCodexTurnStartParams({
               nativeThreadId: threadId,
               codexInput,
               runtimePolicy: turnInput.runtimePolicy,
               modelSelection: turnInput.modelSelection,
-              hasT3Mcp: mcpSession !== undefined,
-              browserToolsAvailable: mcpSession?.browserToolsAvailable ?? true,
-              deviceToolsAvailable: mcpSession?.capabilities?.has("device") ?? false,
               omitServiceTier: adapterOptions.resolveRuntime !== undefined,
-              ...(turnInput.appContext === undefined ? {} : { appContext: turnInput.appContext }),
+              ...(yield* turnContextInputs(turnInput)),
             });
             yield* Ref.update(pendingRootTurns, (current) => {
               const updated = new Map(current);
               updated.set(threadId, turnInput);
               return updated;
             });
-            yield* Ref.update(additionalContextByThread, (current) => {
-              const next = new Map(current);
-              if (turnStartParams.additionalContext)
-                next.set(threadId, turnStartParams.additionalContext);
-              else next.delete(threadId);
-              return next;
-            });
+            yield* rememberAdditionalContext(threadId, turnStartParams.additionalContext);
             const started = yield* client.request("turn/start", turnStartParams);
             yield* registerRootTurn({
               turnInput,
@@ -6701,6 +6749,14 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
               const threadId = yield* getNativeThreadId(turnInput.providerThread);
               yield* Ref.update(pendingRootTurns, (current) =>
                 new Map(current).set(threadId, turnInput),
+              );
+              // A compact as the first action on a reopened process has nothing recorded to restore.
+              yield* rememberAdditionalContext(
+                threadId,
+                codexTurnAdditionalContext({
+                  modelSelection: turnInput.modelSelection,
+                  ...(yield* turnContextInputs(turnInput)),
+                }),
               );
               // Clear on interruption; a late turn/started must not be adopted after an interrupted start.
               yield* client.request("thread/compact/start", { threadId }).pipe(

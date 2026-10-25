@@ -58,6 +58,7 @@ import * as EffectWorker from "../EffectWorker.ts";
 import * as Orchestrator from "../Orchestrator.ts";
 import * as ProviderReplayHarness from "../testkit/ProviderReplayHarness.ts";
 import * as ProviderAdapter from "@t3tools/provider-core/server/ProviderAdapter";
+import { t3AgentInstructionsBlock } from "@t3tools/provider-core/server/orchestrationInstructions";
 import type * as ProviderContinuationRequests from "@t3tools/provider-core/server/ProviderContinuationRequests";
 import * as CodexAdapterV2 from "./CodexAdapterV2.ts";
 import { makeReplayServerConfig, withCodexReplayChildMetadata } from "./CodexAdapterV2.testkit.ts";
@@ -235,6 +236,41 @@ describe("CodexAdapterV2 runtime policy", () => {
         value: "Filtered to overdue",
       });
       assert.isDefined(withT3.additionalContext?.["t3_code_runtime"]);
+    }),
+  );
+
+  it.effect("sends agent instructions as application context, with or without T3 MCP", () =>
+    Effect.gen(function* () {
+      const policy = { runtimeMode: "full-access", interactionMode: "default", cwd: null } as const;
+      const modelSelection = { instanceId: ProviderInstanceId.make("codex"), model: "gpt-5.4" };
+      const agentInstructions = t3AgentInstructionsBlock({
+        name: "reviewer",
+        path: "/repo/.claude/agents/reviewer.md",
+        instructions: "Check every changed line.",
+      });
+      const appContext = [{ key: "mcp_app_todos", text: "Filtered to overdue" }];
+      const withoutMcp = yield* CodexAdapterV2.buildCodexTurnStartParams({
+        nativeThreadId: "native-agent-context",
+        codexInput: [{ type: "text", text: "review" }],
+        runtimePolicy: policy,
+        modelSelection,
+        agentInstructions,
+      });
+      assert.deepEqual(withoutMcp.additionalContext, {
+        t3_code_agent_0001: { kind: "application", value: agentInstructions },
+      });
+      const withMcp = yield* CodexAdapterV2.buildCodexTurnStartParams({
+        nativeThreadId: "native-agent-context",
+        codexInput: [{ type: "text", text: "review" }],
+        runtimePolicy: policy,
+        modelSelection,
+        hasT3Mcp: true,
+        appContext,
+        agentInstructions,
+      });
+      const keys = Object.keys(withMcp.additionalContext ?? {});
+      assert.isBelow(keys.indexOf("t3_code_runtime"), keys.indexOf("t3_code_agent_0001"));
+      assert.isBelow(keys.indexOf("t3_code_agent_0001"), keys.indexOf("mcp_app_todos"));
     }),
   );
 });
@@ -1724,17 +1760,24 @@ describe("CodexAdapterV2 post-settle continuation", () => {
       Effect.gen(function* () {
         const nativeThreadId = "context-thread";
         const nativeTurnId = "context-turn";
+        const agentInstructions = t3AgentInstructionsBlock({
+          name: "reviewer",
+          path: "/repo/.claude/agents/reviewer.md",
+          instructions: "Check every changed line.",
+        });
         const params = yield* CodexAdapterV2.buildCodexTurnStartParams({
           nativeThreadId,
           codexInput: [{ type: "text", text: "work" }],
           runtimePolicy: CODEX_TEST_RUNTIME_POLICY,
           modelSelection: CODEX_TEST_MODEL_SELECTION,
           hasT3Mcp: true,
+          agentInstructions,
         });
         assert.include(
           params.additionalContext?.t3_code_orchestration_01?.value ?? "",
           "delegate_task",
         );
+        assert.equal(params.additionalContext?.t3_code_agent_0001?.value, agentInstructions);
         const entries = codexReplayPreamble({ nativeThreadId, nativeTurnId, prompt: "work" });
         const transcript = makeCodexReplayTranscript({
           scenario: "restore-context",
@@ -1798,15 +1841,16 @@ describe("CodexAdapterV2 post-settle continuation", () => {
           authorizationHeader: "Bearer test",
           browserToolsAvailable: true,
         });
-        yield* harness.runtime.startTurn(
-          makeCodexTestTurnInput({
+        yield* harness.runtime.startTurn({
+          ...makeCodexTestTurnInput({
             threadId: harness.threadId,
             providerThread: harness.providerThread,
             now: yield* DateTime.now,
             attemptId: RunAttemptId.make("context-attempt"),
             text: "work",
           }),
-        );
+          agentInstructions,
+        });
         yield* harness.firstTerminal;
         assert.equal(harness.terminalEvents()[0]?.status, "completed");
       }).pipe(
@@ -1888,6 +1932,105 @@ describe("CodexAdapterV2 post-settle continuation", () => {
           ["running", "completed"],
         );
         assert.equal(items[0]?.id, items[1]?.id);
+        assert.equal(harness.terminalEvents()[0]?.status, "completed");
+      }).pipe(
+        Effect.provide(
+          Layer.mergeAll(IdAllocator.layer, McpProviderSessions.layer, NodeServices.layer),
+        ),
+      ),
+    ),
+  );
+
+  it.effect("restores agent instructions when compaction is the first action after reopening", () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const nativeThreadId = "compact-first-thread";
+        const nativeTurnId = "compact-first-turn";
+        const item = { type: "contextCompaction", id: "compact-first-item" };
+        const agentInstructions = t3AgentInstructionsBlock({
+          name: "reviewer",
+          path: "/repo/.claude/agents/reviewer.md",
+          instructions: "Check every changed line.",
+        });
+        const transcript = makeCodexReplayTranscript({
+          scenario: "native-compaction-first",
+          entries: [
+            ...codexReplayPreamble({ nativeThreadId, nativeTurnId, prompt: "unused" }).slice(0, 5),
+            {
+              type: "expect_outbound",
+              label: "compact",
+              frame: {
+                id: 3,
+                method: "thread/compact/start",
+                params: { threadId: nativeThreadId },
+              },
+            },
+            { type: "emit_inbound", label: "compact", frame: { id: 3, result: {} } },
+            {
+              type: "emit_inbound",
+              label: "start",
+              frame: {
+                method: "turn/started",
+                params: {
+                  threadId: nativeThreadId,
+                  turn: makeCodexReplayTurn({ id: nativeTurnId, status: "inProgress" }),
+                },
+              },
+            },
+            ...(["item/started", "item/completed"] as const).map((method) => ({
+              type: "emit_inbound" as const,
+              label: method,
+              frame: { method, params: { threadId: nativeThreadId, turnId: nativeTurnId, item } },
+            })),
+            {
+              type: "expect_outbound",
+              label: "restore agent",
+              frame: {
+                id: 4,
+                method: "thread/inject_items",
+                params: {
+                  threadId: nativeThreadId,
+                  items: [
+                    {
+                      type: "message",
+                      role: "developer",
+                      content: [
+                        {
+                          type: "input_text",
+                          text: `<t3_code_agent_0001>${agentInstructions}</t3_code_agent_0001>`,
+                        },
+                      ],
+                    },
+                  ],
+                },
+              },
+            },
+            { type: "emit_inbound", label: "restored", frame: { id: 4, result: {} } },
+            {
+              type: "emit_inbound",
+              label: "complete",
+              frame: {
+                method: "turn/completed",
+                params: {
+                  threadId: nativeThreadId,
+                  turn: makeCodexReplayTurn({ id: nativeTurnId, status: "completed" }),
+                },
+              },
+            },
+          ],
+        });
+        const harness = yield* makeCodexReplayHarness(transcript);
+        yield* harness.runtime.compactThread!({
+          ...makeCodexTestTurnInput({
+            threadId: harness.threadId,
+            providerThread: harness.providerThread,
+            now: yield* DateTime.now,
+            attemptId: RunAttemptId.make("compact-first-attempt"),
+            text: "/compact",
+          }),
+          agentInstructions,
+        });
+        yield* harness.firstTerminal;
         assert.equal(harness.terminalEvents()[0]?.status, "completed");
       }).pipe(
         Effect.provide(

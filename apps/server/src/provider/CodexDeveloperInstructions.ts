@@ -1,3 +1,4 @@
+import { utf8ByteLength } from "@t3tools/contracts";
 import type { V2TurnStartParams__AdditionalContextEntry } from "effect-codex-app-server/schema";
 import { buildRuntimeInstructions } from "@t3tools/provider-core/server/runtimeInstructions";
 
@@ -60,4 +61,30 @@ export function buildCodexAdditionalContext(
     },
     ...(tools ? { t3_code_tools: { kind: "application", value: tools } } : {}),
   };
+}
+
+/** Splits the rendered agent block on code-point boundaries into capped entries whose values rejoin exactly. */
+export function codexAgentInstructionEntries(
+  block: string,
+): Record<string, V2TurnStartParams__AdditionalContextEntry> {
+  const values: Array<string> = [];
+  let current = "";
+  let currentBytes = 0;
+  for (const character of block) {
+    const bytes = utf8ByteLength(character);
+    if (currentBytes + bytes > CODEX_ADDITIONAL_CONTEXT_VALUE_MAX_BYTES) {
+      values.push(current);
+      current = "";
+      currentBytes = 0;
+    }
+    current += character;
+    currentBytes += bytes;
+  }
+  if (current !== "") values.push(current);
+  return Object.fromEntries(
+    values.map((value, index) => [
+      `t3_code_agent_${String(index + 1).padStart(4, "0")}`,
+      { kind: "application" as const, value },
+    ]),
+  );
 }
