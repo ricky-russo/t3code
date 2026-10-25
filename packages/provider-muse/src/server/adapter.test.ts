@@ -31,6 +31,7 @@ import * as Layer from "effect/Layer";
 import * as Queue from "effect/Queue";
 import * as Schema from "effect/Schema";
 import * as Stream from "effect/Stream";
+import { t3AgentInstructionsBlock } from "@t3tools/provider-core/server/orchestrationInstructions";
 import * as TestClock from "effect/testing/TestClock";
 
 import * as TestProviderHost from "@t3tools/provider-testing/TestProviderHost";
@@ -1567,6 +1568,100 @@ describe("MuseAdapterV2", () => {
       assert.strictEqual(terminal.status, "failed");
       assert.strictEqual(terminal.threadDisposition, "reusable");
       yield* startConversation(harness, fake, 2);
+    }).pipe(Effect.scoped, Effect.provide(testLayer)),
+  );
+
+  it.effect(
+    "sends the agent definition once per host runtime, after the runtime instructions",
+    () =>
+      Effect.gen(function* () {
+        const agentInstructions = t3AgentInstructionsBlock({
+          name: "reviewer",
+          path: "/repo/.claude/agents/reviewer.md",
+          instructions: "Check every changed line.",
+        });
+        const fake = yield* makeFakeMuse();
+        const harness = yield* makeHarness(fake);
+        const withAgent = Effect.fnUntraced(function* (ordinal: number) {
+          return {
+            ...(yield* turnInput(harness.providerThread, ordinal, harness.policy)),
+            agentInstructions,
+          };
+        });
+        const turnTexts = Effect.fnUntraced(function* (ordinal: number) {
+          yield* harness.runtime.startTurn(yield* withAgent(ordinal));
+          const call = yield* fake.takeCall("turn/start");
+          yield* fake.emit("turn/completed", { turnId: call.commandId, terminal: "completed" });
+          yield* harness.takeEvent("turn.terminal");
+          return (
+            call.params.input as Array<{ readonly type: string; readonly text?: string }>
+          ).map((item) => item.text);
+        });
+
+        // A compaction that fails before any prompt must not spend the delivery.
+        fake.queueResponse("session/compact", { status: "noop", reason: "no_compactable_history" });
+        yield* harness.runtime.compactThread!(yield* withAgent(1));
+        assert.strictEqual((yield* harness.takeEvent("turn.terminal")).status, "failed");
+
+        const first = yield* turnTexts(2);
+        assert.strictEqual(first[1], agentInstructions);
+        assert.include(first[0] ?? "", "Muse Code");
+        assert.strictEqual(first.at(-1), "Hello Muse");
+        const second = yield* turnTexts(3);
+        assert.notInclude(second, agentInstructions);
+
+        const reopenedFake = yield* makeFakeMuse("reopened");
+        const reopened = yield* makeHarness(reopenedFake, INSTANCE_ID, "saved-native-session");
+        yield* reopened.runtime.startTurn({
+          ...(yield* turnInput(reopened.providerThread, 4, reopened.policy)),
+          agentInstructions,
+        });
+        const resumedCall = yield* reopenedFake.takeCall("turn/start");
+        assert.strictEqual(
+          (resumedCall.params.input as Array<{ readonly text?: string }>)[1]?.text,
+          agentInstructions,
+        );
+      }).pipe(Effect.scoped, Effect.provide(testLayer)),
+  );
+
+  it.effect("sends the agent definition again to a fresh session on a relaunched host", () =>
+    Effect.gen(function* () {
+      const agentInstructions = t3AgentInstructionsBlock({
+        name: "reviewer",
+        path: "/repo/.claude/agents/reviewer.md",
+        instructions: "Check every changed line.",
+      });
+      const fake = yield* makeFakeMuse("first");
+      const recovery = yield* makeFakeMuse("second");
+      const harness = yield* makeHarness(fake, INSTANCE_ID, undefined, recovery);
+      const turnTexts = Effect.fnUntraced(function* (
+        host: typeof fake,
+        providerThread: OrchestrationV2ProviderThread,
+        ordinal: number,
+      ) {
+        yield* harness.runtime.startTurn({
+          ...(yield* turnInput(providerThread, ordinal, harness.policy)),
+          agentInstructions,
+        });
+        const call = yield* host.takeCall("turn/start");
+        yield* host.emit("turn/completed", { turnId: call.commandId, terminal: "completed" });
+        yield* harness.takeEvent("turn.terminal");
+        return (call.params.input as Array<{ readonly text?: string }>).map((item) => item.text);
+      });
+
+      assert.include(yield* turnTexts(fake, harness.providerThread, 1), agentInstructions);
+      yield* fake.disconnect();
+      yield* harness.takeEvent(
+        "provider_session.updated",
+        (event) => event.providerSession.status === "error",
+      );
+      const fresh = yield* harness.runtime.ensureThread({
+        threadId: THREAD_ID,
+        modelSelection: modelSelection(),
+        runtimePolicy,
+        existingProviderThread: { ...harness.providerThread, nativeThreadRef: null },
+      });
+      assert.include(yield* turnTexts(recovery, fresh, 2), agentInstructions);
     }).pipe(Effect.scoped, Effect.provide(testLayer)),
   );
 

@@ -324,6 +324,8 @@ export const makeMuseAdapterV2 = Effect.fn("makeMuseAdapterV2")(function* (
       let relaunchable = false;
       let nativeSessionId: string | undefined;
       let thread: OrchestrationV2ProviderThread | undefined;
+      // Muse has no system channel; the agent block goes once per attached native session, as user text.
+      let agentInstructionsPending = true;
       let active: ActiveTurn | undefined;
       let lastProviderTurn: OrchestrationV2ProviderTurn | undefined;
       let latestSubscriptionUsage: MuseSubscriptionUsage | undefined;
@@ -1856,6 +1858,7 @@ export const makeMuseAdapterV2 = Effect.fn("makeMuseAdapterV2")(function* (
           );
           if (result.session.sessionId !== nativeSessionId)
             return yield* protocolError("Muse returned a different session identity");
+          agentInstructionsPending = true;
           if (requestedId)
             yield* request("session/setApprovalMode", {
               mode: museApprovalMode(args.runtimePolicy.runtimeMode),
@@ -2051,6 +2054,9 @@ export const makeMuseAdapterV2 = Effect.fn("makeMuseAdapterV2")(function* (
                 `Muse returned an unsupported compaction status: ${result.status}`,
               );
           } else {
+            const agentInstructions = agentInstructionsPending
+              ? turnInput.agentInstructions
+              : undefined;
             const result = yield* request(
               "turn/start",
               {
@@ -2063,6 +2069,9 @@ export const makeMuseAdapterV2 = Effect.fn("makeMuseAdapterV2")(function* (
                       reasoningEffort: effort,
                     }),
                   },
+                  ...(agentInstructions === undefined
+                    ? []
+                    : [{ type: "text", text: agentInstructions }]),
                   ...parts,
                 ],
                 displayText: turnInput.message.text || "Image attachment",
@@ -2074,6 +2083,7 @@ export const makeMuseAdapterV2 = Effect.fn("makeMuseAdapterV2")(function* (
               true,
               nativeId,
             ).pipe(Effect.flatMap((value) => decode(MuseTurnStartResult, value)));
+            if (agentInstructions !== undefined) agentInstructionsPending = false;
             if (result.turnId !== nativeId) {
               yield* eventPermit.withPermits(1)(
                 failHost(new Error("Muse admitted an unowned turn")),

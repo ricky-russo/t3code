@@ -83,18 +83,25 @@ export function t3AcpPromptWithInstructions(input: {
   return `<t3_code_instructions>\n${instructions.join("\n\n")}\n</t3_code_instructions>\n\n<user_request>\n${input.prompt}\n</user_request>`;
 }
 
-function prependT3OrchestrationInstructions(prompt: string): string {
-  return `<t3_code_orchestration_instructions>${T3_CODE_ORCHESTRATION_INSTRUCTIONS.trim()}</t3_code_orchestration_instructions>\n\n<user_request>\n${prompt}\n</user_request>`;
-}
-
-export function t3OrchestrationPromptForFirstRun(input: {
+/** Cursor has no system channel; the adapter decides when instructions are `pending`. */
+export function t3CursorPromptWithInstructions(input: {
   readonly prompt: string;
-  readonly runOrdinal: number;
+  readonly pending: boolean;
   readonly hasT3Mcp: boolean;
-}): string {
-  return input.runOrdinal === 1 && input.hasT3Mcp
-    ? prependT3OrchestrationInstructions(input.prompt)
-    : input.prompt;
+  readonly agentInstructions?: string;
+}): { readonly text: string; readonly delivered: boolean } {
+  const sections = input.pending
+    ? [
+        ...(input.hasT3Mcp ? [T3_CODE_ORCHESTRATION_INSTRUCTIONS.trim()] : []),
+        ...(input.agentInstructions === undefined ? [] : [input.agentInstructions]),
+      ]
+    : [];
+  return sections.length === 0
+    ? { text: input.prompt, delivered: false }
+    : {
+        text: `<t3_code_orchestration_instructions>${sections.join("\n\n")}</t3_code_orchestration_instructions>\n\n<user_request>\n${input.prompt}\n</user_request>`,
+        delivered: true,
+      };
 }
 
 export function t3OrchestrationSystemPrompt(hasT3Mcp: boolean): string | undefined {

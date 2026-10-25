@@ -26,6 +26,10 @@ import * as TestProviderHost from "@t3tools/provider-testing/TestProviderHost";
 import * as IdAllocator from "@t3tools/provider-core/server/IdAllocator";
 import * as McpProviderSessions from "@t3tools/provider-core/server/McpProviderSessions";
 import * as ProviderAdapter from "@t3tools/provider-core/server/ProviderAdapter";
+import {
+  T3_CODE_ORCHESTRATION_INSTRUCTIONS,
+  t3AgentInstructionsBlock,
+} from "@t3tools/provider-core/server/orchestrationInstructions";
 import { makeProviderFailure } from "@t3tools/provider-core/server/failure";
 import {
   cursorMcpServers,
@@ -38,6 +42,134 @@ import * as CursorAgentSdk from "./CursorAgentSdk.ts";
 import { ConfigurationError } from "./sdk.ts";
 
 const decodeCursorSettings = Schema.decodeEffect(CursorSettings);
+
+const makeCursorPromptHarness = Effect.fn("test.makeCursorPromptHarness")(function* (options: {
+  readonly agentInstructions?: string;
+  readonly withT3Mcp?: boolean;
+}) {
+  const fileSystem = yield* FileSystem.FileSystem;
+  const workspace = yield* fileSystem.makeTempDirectoryScoped({ prefix: "cursor-v2-prompt-" });
+  const sentMessages: Array<string> = [];
+  const instanceId = ProviderInstanceId.make("cursor");
+  const threadId = ThreadId.make("cursor-prompt-thread");
+  const modelSelection = { instanceId, model: "composer-2.5" };
+  const runtimePolicy = ProviderAdapter.ProviderAdapterV2RuntimePolicy.make({
+    runtimeMode: "full-access",
+    interactionMode: "default",
+    cwd: workspace,
+  });
+  if (options.withT3Mcp === true) {
+    yield* (yield* McpProviderSessions.McpProviderSessions).set({
+      environmentId: EnvironmentId.make("cursor-prompt-environment"),
+      threadId,
+      providerSessionId: "cursor-prompt-session",
+      providerInstanceId: instanceId,
+      endpoint: "http://127.0.0.1:43123/mcp",
+      authorizationHeader: "Bearer synthetic-cursor-token",
+      browserToolsAvailable: false,
+    });
+  }
+  const adapter = yield* makeCursorAdapterV2({
+    instanceId,
+    settings: yield* decodeCursorSettings({}),
+    environment: { HOME: workspace },
+  }).pipe(
+    Effect.provideService(CursorAgentSdk.CursorAgentSdkRunner, {
+      assertComplete: Effect.void,
+      open: () =>
+        Effect.succeed({
+          agentId: "native-cursor-agent",
+          listMessages: Effect.succeed([]),
+          close: Effect.void,
+          send: (input) =>
+            Effect.sync(() => {
+              sentMessages.push(
+                typeof input.message === "string" ? input.message : input.message.text,
+              );
+              const runId = `native-cursor-agent-run-${sentMessages.length}`;
+              return {
+                agentId: "native-cursor-agent",
+                runId,
+                wait: Effect.succeed({
+                  id: runId,
+                  requestId: `native-request-${sentMessages.length}`,
+                  status: "finished" as const,
+                  model: { id: "composer-2.5" },
+                  durationMs: 1,
+                }),
+                cancel: Effect.void,
+              };
+            }),
+        }),
+    }),
+    Effect.provide(TestProviderHost.layer({ cwd: workspace })),
+  );
+  const now = yield* DateTime.now;
+  return Effect.fnUntraced(function* (sessionId: string) {
+    const runtime = yield* adapter.openSession({
+      threadId,
+      providerSessionId: ProviderSessionId.make(sessionId),
+      modelSelection,
+      runtimePolicy,
+    });
+    const openThread = runtime.ensureThread({ threadId, modelSelection, runtimePolicy });
+    const providerThread = yield* openThread;
+    const appThread = {
+      id: threadId,
+      projectId: ProjectId.make("cursor-prompt-project"),
+      createdBy: "user" as const,
+      creationSource: "web" as const,
+      title: "Cursor prompt",
+      providerInstanceId: instanceId,
+      modelSelection,
+      runtimeMode: "full-access" as const,
+      interactionMode: "default" as const,
+      branch: null,
+      worktreePath: null,
+      activeProviderThreadId: providerThread.id,
+      lineage: { parentThreadId: null, relationshipToParent: null, rootThreadId: threadId },
+      forkedFrom: null,
+      createdAt: now,
+      updatedAt: now,
+      archivedAt: null,
+      settledOverride: null,
+      settledAt: null,
+      lastVisitedAt: null,
+      deletedAt: null,
+    };
+    const turn = Effect.fnUntraced(function* (ordinal: number, text: string) {
+      const input = {
+        threadId,
+        providerThread,
+        modelSelection,
+        runtimePolicy,
+        runId: RunId.make(`cursor-prompt-run-${ordinal}`),
+        runOrdinal: ordinal,
+        providerTurnOrdinal: ordinal,
+        attemptId: RunAttemptId.make(`cursor-prompt-attempt-${ordinal}`),
+        rootNodeId: NodeId.make(`cursor-prompt-root-${ordinal}`),
+        appThread,
+        message: {
+          messageId: MessageId.make(`cursor-prompt-message-${ordinal}`),
+          createdBy: "user" as const,
+          creationSource: "web" as const,
+          text,
+          attachments: [],
+        },
+        ...(options.agentInstructions === undefined
+          ? {}
+          : { agentInstructions: options.agentInstructions }),
+      };
+      yield* text === "/compress" ? runtime.compactThread!(input) : runtime.startTurn(input);
+      yield* runtime.events.pipe(
+        Stream.filter((event) => event.type === "turn.terminal"),
+        Stream.runHead,
+      );
+      return sentMessages.at(-1) ?? "";
+    });
+    return { turn, openFreshAgent: openThread };
+  });
+});
 
 describe("CursorAdapterV2", () => {
   it.effect.each([
@@ -585,6 +717,60 @@ describe("CursorAdapterV2", () => {
         Stream.runHead,
       );
       assert.equal(sentMessages[1], "/compress");
+    }).pipe(
+      Effect.scoped,
+      Effect.provide(
+        Layer.mergeAll(NodeServices.layer, IdAllocator.layer, McpProviderSessions.layer),
+      ),
+    ),
+  );
+
+  it.effect("sends the agent definition once per native agent, never on /compress", () =>
+    Effect.gen(function* () {
+      const agentInstructions = t3AgentInstructionsBlock({
+        name: "reviewer",
+        path: "/repo/.claude/agents/reviewer.md",
+        instructions: "Check every changed line.",
+      });
+      const openRuntime = yield* makeCursorPromptHarness({ agentInstructions });
+      const wrapped = (text: string) =>
+        `<t3_code_orchestration_instructions>${agentInstructions}</t3_code_orchestration_instructions>\n\n<user_request>\n${text}\n</user_request>`;
+
+      const first = yield* openRuntime("cursor-agent-session-1");
+      assert.equal(yield* first.turn(1, "/compress"), "/compress");
+      assert.isTrue(
+        (yield* first.turn(2, "Review the diff.")).startsWith(wrapped("Review the diff.")),
+      );
+      assert.isTrue((yield* first.turn(3, "Keep going.")).startsWith("Keep going.\n\n"));
+      yield* first.openFreshAgent;
+      assert.isTrue(
+        (yield* first.turn(4, "After a fresh agent.")).startsWith(wrapped("After a fresh agent.")),
+      );
+      const second = yield* openRuntime("cursor-agent-session-2");
+      assert.isTrue(
+        (yield* second.turn(5, "After a restart.")).startsWith(wrapped("After a restart.")),
+      );
+    }).pipe(
+      Effect.scoped,
+      Effect.provide(
+        Layer.mergeAll(NodeServices.layer, IdAllocator.layer, McpProviderSessions.layer),
+      ),
+    ),
+  );
+
+  it.effect("re-sends T3's orchestration text on the first prompt of each runtime", () =>
+    Effect.gen(function* () {
+      const openRuntime = yield* makeCursorPromptHarness({ withT3Mcp: true });
+      const wrapped = (text: string) =>
+        `<t3_code_orchestration_instructions>${T3_CODE_ORCHESTRATION_INSTRUCTIONS.trim()}</t3_code_orchestration_instructions>\n\n<user_request>\n${text}\n</user_request>`;
+
+      const first = yield* openRuntime("cursor-t3-session-1");
+      assert.isTrue((yield* first.turn(1, "Start.")).startsWith(wrapped("Start.")));
+      assert.isTrue((yield* first.turn(2, "Keep going.")).startsWith("Keep going.\n\n"));
+      const second = yield* openRuntime("cursor-t3-session-2");
+      assert.isTrue(
+        (yield* second.turn(3, "After a restart.")).startsWith(wrapped("After a restart.")),
+      );
     }).pipe(
       Effect.scoped,
       Effect.provide(
