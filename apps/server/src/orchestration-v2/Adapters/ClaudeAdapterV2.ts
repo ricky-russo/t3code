@@ -1331,6 +1331,7 @@ export function makeClaudeQueryOptions(input: {
   readonly supportedDialogKinds?: ClaudeQueryOptions["supportedDialogKinds"];
   readonly allowDangerouslySkipPermissions?: boolean;
   readonly appendSystemPromptFileText?: string;
+  readonly agentInstructions?: string;
   // Flag settings, because a user's settings.json env beats the process env in Claude Code.
   readonly toolSearchOverride?: "true";
 }): ClaudeAgentSdkQueryOptions {
@@ -1437,6 +1438,7 @@ export function makeClaudeQueryOptions(input: {
           (input.mcpServers === undefined
             ? ""
             : T3_CODE_ORCHESTRATION_INSTRUCTIONS + CLAUDE_BACKGROUND_WAIT_INSTRUCTIONS),
+        ...(input.agentInstructions === undefined ? [] : [input.agentInstructions]),
         ...launchAppendSystemPrompt,
       ].join("\n\n"),
     },
@@ -9367,6 +9369,9 @@ export const makeClaudeAdapterV2 = Effect.fn("makeClaudeAdapterV2")(function* (
             onUserDialog,
             supportedDialogKinds: ["resume_return"],
             ...(appendSystemPromptFileText === undefined ? {} : { appendSystemPromptFileText }),
+            ...(turnInput.agentInstructions === undefined
+              ? {}
+              : { agentInstructions: turnInput.agentInstructions }),
             ...(toolSearchOverride === undefined ? {} : { toolSearchOverride }),
           });
           const querySession = yield* queryRunner

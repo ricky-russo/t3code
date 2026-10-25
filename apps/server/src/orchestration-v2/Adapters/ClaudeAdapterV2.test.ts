@@ -88,6 +88,7 @@ import { OrchestratorToolkit } from "../../mcp/toolkits/orchestrator/tools.ts";
 import { ClaudeExecutableFileCheck } from "../../provider/Drivers/ClaudeExecutable.ts";
 import * as ProviderEventLoggers from "@t3tools/provider-core/server/ProviderEventLoggers";
 import * as ProviderAdapter from "@t3tools/provider-core/server/ProviderAdapter";
+import { t3AgentInstructionsBlock } from "@t3tools/provider-core/server/orchestrationInstructions";
 import type * as ProviderContinuationRequests from "@t3tools/provider-core/server/ProviderContinuationRequests";
 import { makeProviderFailure } from "@t3tools/provider-core/server/failure";
 import * as ClaudeAdapterV2 from "./ClaudeAdapterV2.ts";
@@ -850,7 +851,13 @@ describe("ClaudeAdapterV2 Auto-accept edits", () => {
 });
 
 describe("ClaudeAdapterV2 append-system-prompt-file launch argument", () => {
-  const startTurnWithLaunchArgs = Effect.fnUntraced(function* (launchArgs: string, cwd: string) {
+  const startTurnWithLaunchArgs = Effect.fnUntraced(function* (
+    launchArgs: string,
+    cwd: string,
+    turns: ReadonlyArray<{ readonly text: string; readonly agentInstructions?: string }> = [
+      { text: "What is the sentinel?" },
+    ],
+  ) {
     const fileSystem = yield* FileSystem.FileSystem;
     const opened: Array<ClaudeAdapterV2.ClaudeAgentSdkQueryOptions> = [];
     const adapter = yield* ClaudeAdapterV2.makeClaudeAdapterV2({
@@ -890,30 +897,38 @@ describe("ClaudeAdapterV2 append-system-prompt-file launch argument", () => {
       cwd,
     });
     const threadId = ThreadId.make("thread-claude-append-file");
-    const runtime = yield* adapter.openSession({
-      threadId,
-      providerSessionId: ProviderSessionId.make("provider-session-claude-append-file"),
-      modelSelection: CLAUDE_TEST_MODEL_SELECTION,
-      runtimePolicy,
-    });
-    const providerThread = yield* runtime.ensureThread({
-      threadId,
-      modelSelection: CLAUDE_TEST_MODEL_SELECTION,
-      runtimePolicy,
-    });
-    const exit = yield* runtime
-      .startTurn(
-        makeClaudeTestTurnInput({
-          threadId,
-          providerThread,
-          now: yield* DateTime.now,
-          attemptId: RunAttemptId.make("attempt-claude-append-file"),
-          text: "What is the sentinel?",
-          attachments: [],
-          runtimePolicy,
-        }),
-      )
-      .pipe(Effect.exit);
+    let exit: Exit.Exit<void, unknown> = Exit.void;
+    // Each turn runs in a fresh session runtime, as after a server restart.
+    for (const [index, turn] of turns.entries()) {
+      const runtime = yield* adapter.openSession({
+        threadId,
+        providerSessionId: ProviderSessionId.make(`provider-session-claude-append-file-${index}`),
+        modelSelection: CLAUDE_TEST_MODEL_SELECTION,
+        runtimePolicy,
+      });
+      const providerThread = yield* runtime.ensureThread({
+        threadId,
+        modelSelection: CLAUDE_TEST_MODEL_SELECTION,
+        runtimePolicy,
+      });
+      exit = yield* runtime
+        .startTurn({
+          ...makeClaudeTestTurnInput({
+            threadId,
+            providerThread,
+            now: yield* DateTime.now,
+            attemptId: RunAttemptId.make(`attempt-claude-append-file-${index}`),
+            text: turn.text,
+            attachments: [],
+            runtimePolicy,
+          }),
+          ...(turn.agentInstructions === undefined
+            ? {}
+            : { agentInstructions: turn.agentInstructions }),
+        })
+        .pipe(Effect.exit);
+      if (Exit.isFailure(exit)) break;
+    }
     return { exit, opened };
   });
 
@@ -940,6 +955,41 @@ describe("ClaudeAdapterV2 append-system-prompt-file launch argument", () => {
         assert.isUndefined(opened[0]!.extraArgs?.["append-system-prompt"]);
         assert.isUndefined(opened[0]!.extraArgs?.["append-system-prompt-file"]);
         assert.equal(opened[0]!.extraArgs?.["system-prompt"], "Replacement");
+      }).pipe(
+        Effect.provide(
+          Layer.mergeAll(IdAllocator.layer, McpProviderSessions.layer, NodeServices.layer),
+        ),
+      ),
+    ),
+  );
+
+  it.effect("appends the agent definition after T3's text on every query it opens", () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const fileSystem = yield* FileSystem.FileSystem;
+        const cwd = yield* fileSystem.makeTempDirectoryScoped({ prefix: "t3-claude-agent-cwd-" });
+        const agentInstructions = t3AgentInstructionsBlock({
+          name: "reviewer",
+          path: "/repo/.claude/agents/reviewer.md",
+          instructions: "Check every changed line.",
+        });
+        const plain = yield* startTurnWithLaunchArgs("", cwd);
+        const { exit, opened } = yield* startTurnWithLaunchArgs(
+          '--append-system-prompt "Inline sentinel"',
+          cwd,
+          [
+            { text: "Review the diff.", agentInstructions },
+            { text: "Keep going.", agentInstructions },
+          ],
+        );
+        assert.isTrue(Exit.isSuccess(exit));
+        assert.lengthOf(opened, 2);
+        for (const options of opened) {
+          assert.equal(
+            appendSystemPrompt(options),
+            `${appendSystemPrompt(plain.opened[0])}\n\n${agentInstructions}\n\nInline sentinel`,
+          );
+        }
       }).pipe(
         Effect.provide(
           Layer.mergeAll(IdAllocator.layer, McpProviderSessions.layer, NodeServices.layer),
