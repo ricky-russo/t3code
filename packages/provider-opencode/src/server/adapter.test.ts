@@ -12,6 +12,7 @@ import {
   RunAttemptId,
   RunId,
   MessageId,
+  type OrchestrationV2AppThread,
   ThreadId,
   type OrchestrationV2ProviderThread,
   type OrchestrationV2ProviderTurn,
@@ -32,6 +33,8 @@ import * as Stream from "effect/Stream";
 import * as ProviderHost from "@t3tools/provider-core/server/ProviderHost";
 import * as TestProviderHost from "@t3tools/provider-testing/TestProviderHost";
 import type * as ProviderEventLoggers from "@t3tools/provider-core/server/ProviderEventLoggers";
+import { t3AgentInstructionsBlock } from "@t3tools/provider-core/server/orchestrationInstructions";
+import { buildRuntimeInstructions } from "@t3tools/provider-core/server/runtimeInstructions";
 import * as OpenCodeRuntime from "./OpenCodeRuntime.ts";
 import * as IdAllocator from "@t3tools/provider-core/server/IdAllocator";
 import * as McpProviderSessions from "@t3tools/provider-core/server/McpProviderSessions";
@@ -2175,6 +2178,118 @@ describe("OpenCodeAdapterV2", () => {
       for (const input of createInputs) {
         assert.notProperty(input, "title");
       }
+    }).pipe(
+      Effect.scoped,
+      Effect.provide(
+        Layer.mergeAll(
+          IdAllocator.layer,
+          McpProviderSessions.layer,
+          TestProviderHost.layer().pipe(Layer.provide(NodeServices.layer)),
+        ),
+      ),
+    ),
+  );
+
+  it.effect("sends the agent definition after T3's text in every prompt's system field", () =>
+    Effect.gen(function* () {
+      const promptInputs: Array<{ readonly system?: string }> = [];
+      const fakeClient = {
+        event: {
+          subscribe: async (_input?: unknown, options?: { readonly signal?: AbortSignal }) => ({
+            stream: {
+              [Symbol.asyncIterator]: () => ({
+                next: () =>
+                  new Promise<IteratorResult<never>>((resolve) => {
+                    const done = () => resolve({ done: true, value: undefined });
+                    if (options?.signal?.aborted) return done();
+                    options?.signal?.addEventListener("abort", done, { once: true });
+                  }),
+              }),
+            },
+          }),
+        },
+        session: {
+          create: async () => ({
+            data: { id: "ses_native_agent", time: { created: 1, updated: 1 } },
+          }),
+          get: async () => ({
+            data: { id: "ses_native_agent", time: { created: 1, updated: 1 } },
+          }),
+          promptAsync: async (input: { readonly system?: string }) => {
+            promptInputs.push(input);
+            return { data: true };
+          },
+          status: async () => ({ data: { ses_native_agent: { type: "busy" } } }),
+          messages: async () => ({ data: [] }),
+          children: async () => ({ data: [] }),
+          abort: async () => ({ data: true }),
+        },
+      } as unknown as OpencodeClient;
+      const unused = (operation: string) => () => Effect.die(`${operation} is not used`);
+      const runtime: OpenCodeRuntime.OpenCodeRuntime["Service"] = {
+        startOpenCodeServerProcess: unused("startOpenCodeServerProcess"),
+        connectToOpenCodeServer: () =>
+          Effect.succeed({
+            url: "test://opencode",
+            version: "test",
+            exitCode: null,
+            external: true,
+          }),
+        runOpenCodeCommand: unused("runOpenCodeCommand"),
+        createOpenCodeSdkClient: () => fakeClient,
+        loadOpenCodeInventory: unused("loadOpenCodeInventory"),
+        loadInventoryFromCli: unused("loadInventoryFromCli"),
+        loadOpenCodeSkills: unused("loadOpenCodeSkills"),
+        loadSkillsFromCli: unused("loadSkillsFromCli"),
+      };
+      const instanceId = ProviderInstanceId.make("opencode");
+      const threadId = ThreadId.make("thread-opencode-agent");
+      const modelSelection = { instanceId, model: "opencode/big-pickle" };
+      const adapter = yield* makeOpenCodeAdapterV2({
+        instanceId,
+        settings: OPENCODE_TEST_SETTINGS,
+        environment: {},
+      }).pipe(Effect.provideService(OpenCodeRuntime.OpenCodeRuntime, runtime));
+      const session = yield* adapter.openSession({
+        threadId,
+        providerSessionId: ProviderSessionId.make("provider-session-opencode-agent"),
+        modelSelection,
+        runtimePolicy: runtimePolicy("full-access"),
+      });
+      const providerThread = yield* session.ensureThread({
+        threadId,
+        modelSelection,
+        runtimePolicy: runtimePolicy("full-access"),
+      });
+      const agentInstructions = t3AgentInstructionsBlock({
+        name: "reviewer",
+        path: "/repo/.claude/agents/reviewer.md",
+        instructions: "Check every changed line.",
+      });
+      yield* session.startTurn({
+        appThread: { id: threadId, title: "Agent" } as OrchestrationV2AppThread,
+        threadId,
+        runId: RunId.make("run-opencode-agent"),
+        runOrdinal: 1,
+        providerTurnOrdinal: 1,
+        attemptId: RunAttemptId.make("attempt-opencode-agent"),
+        rootNodeId: NodeId.make("node-opencode-agent"),
+        providerThread,
+        message: {
+          messageId: MessageId.make("message-opencode-agent"),
+          text: "Review the diff.",
+          attachments: [],
+          createdBy: "user",
+          creationSource: "web",
+        },
+        modelSelection,
+        runtimePolicy: runtimePolicy("full-access"),
+        agentInstructions,
+      });
+      assert.equal(
+        promptInputs[0]?.system,
+        `${buildRuntimeInstructions({ harness: "OpenCode", model: "opencode/big-pickle" })}\n\n${agentInstructions}`,
+      );
     }).pipe(
       Effect.scoped,
       Effect.provide(

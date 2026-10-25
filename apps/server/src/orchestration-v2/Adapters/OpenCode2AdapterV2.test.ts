@@ -39,6 +39,7 @@ import { TestClock } from "effect/testing";
 
 import type * as ProviderAdapter from "@t3tools/provider-core/server/ProviderAdapter";
 import * as McpProviderSessions from "@t3tools/provider-core/server/McpProviderSessions";
+import { t3AgentInstructionsBlock } from "@t3tools/provider-core/server/orchestrationInstructions";
 import { buildRuntimeInstructions } from "@t3tools/provider-core/server/runtimeInstructions";
 import * as IdAllocator from "@t3tools/provider-core/server/IdAllocator";
 import * as ProviderContinuationRequests from "@t3tools/provider-core/server/ProviderContinuationRequests";
@@ -2354,6 +2355,39 @@ it.layer(McpProviderSessions.layer)("OpenCode2 adapter", (it) => {
         assert.equal((yield* Fiber.join(terminal))?.status, "completed");
       }
     }).pipe(Effect.scoped),
+  );
+
+  it.effect(
+    "puts the agent definition after T3's text in the session instructions without MCP",
+    () =>
+      Effect.gen(function* () {
+        const agentInstructions = t3AgentInstructionsBlock({
+          name: "reviewer",
+          path: "/repo/.claude/agents/reviewer.md",
+          instructions: "Check every changed line.",
+        });
+        const turn = [
+          out("session.prompt", { sessionID: SESSION, text: "<any>" }),
+          promptAccepted,
+          event("session.execution.succeeded", { sessionID: SESSION }),
+        ];
+        const { runtime, thread } = yield* resumed([
+          ...turn,
+          out("session.instructions.entry.put", {
+            sessionID: SESSION,
+            key: "t3-code",
+            value: `${buildRuntimeInstructions({ harness: "OpenCode", model: bigPickle.model })}\n\n${agentInstructions}`,
+          }),
+          reply("session.instructions.entry.put", null),
+          ...turn,
+        ]);
+        const plain = yield* terminalOf(runtime).pipe(Effect.forkScoped);
+        yield* runtime.startTurn(turnInput(thread));
+        assert.equal((yield* Fiber.join(plain))?.status, "completed");
+        const withAgent = yield* terminalOf(runtime).pipe(Effect.forkScoped);
+        yield* runtime.startTurn({ ...turnInput(thread), agentInstructions });
+        assert.equal((yield* Fiber.join(withAgent))?.status, "completed");
+      }).pipe(Effect.scoped),
   );
 
   it.effect("registers a long thread id's MCP server under a name OpenCode accepts", () =>
