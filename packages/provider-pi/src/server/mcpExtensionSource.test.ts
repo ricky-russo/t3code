@@ -75,6 +75,39 @@ describe("Pi orchestration prompt section", () => {
       assert.include(result!.systemPrompt, "orchestrator_capabilities");
     }
   });
+
+  it("appends the agent definition file after the orchestration text, and nothing when it is missing", async () => {
+    const directory = await NodeFSP.mkdtemp(
+      NodePath.join(NodeOS.tmpdir(), "pi-agent-instructions-"),
+    );
+    const agentInstructionsPath = NodePath.join(directory, "reviewer.md");
+    const bridge = await loadMcpBridge({ agentInstructionsPath });
+    const hook = bridge.handlers.get("before_agent_start")!;
+    const missing = await hook({ systemPrompt: "base" }, { ui: { notify: assert.fail } });
+    assert.isTrue(
+      missing!.systemPrompt.endsWith(
+        "preview tools only, no web fetch. Close a tab you opened before you reply, unless the user asked for it or uses it.",
+      ),
+    );
+    assert.notInclude(missing!.systemPrompt, "agent_definition");
+
+    const block =
+      '## T3 Code agent definition\n\n<agent_definition name="reviewer" path="/repo/reviewer.md">\nCheck every line.\n</agent_definition>';
+    await NodeFSP.writeFile(agentInstructionsPath, `${block}\n`);
+    const withAgent = await hook({ systemPrompt: "base" }, { ui: { notify: assert.fail } });
+    assert.isTrue(withAgent!.systemPrompt.endsWith(`\n\n${block}`));
+    assert.isBelow(
+      withAgent!.systemPrompt.indexOf("orchestrator_capabilities"),
+      withAgent!.systemPrompt.indexOf("agent_definition"),
+    );
+    const sections: Record<string, string> = {};
+    const sectioned = await hook(
+      { systemPrompt: "base", systemPromptOptions: { sections } },
+      { ui: { notify: assert.fail } },
+    );
+    assert.isUndefined(sectioned);
+    assert.isTrue(sections.t3_code_orchestration!.endsWith(`\n\n${block}`));
+  });
 });
 
 describe("Pi MCP tool results", () => {

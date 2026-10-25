@@ -28,9 +28,11 @@ import * as Fiber from "effect/Fiber";
 import * as Layer from "effect/Layer";
 import * as Queue from "effect/Queue";
 import * as Schema from "effect/Schema";
+import * as Scope from "effect/Scope";
 import * as Sink from "effect/Sink";
 import * as Stream from "effect/Stream";
 import * as ChildProcess from "effect/process/ChildProcess";
+import * as FileSystem from "effect/FileSystem";
 import * as ChildProcessSpawner from "effect/process/ChildProcessSpawner";
 
 import * as TestProviderHost from "@t3tools/provider-testing/TestProviderHost";
@@ -49,6 +51,8 @@ import {
   type PiAdapterV2Options,
 } from "./adapter.ts";
 import { makePiRpcConnection, type PiRpcRecord } from "./rpc.ts";
+import { T3_PI_AGENT_INSTRUCTIONS_PATH_ENV } from "./mcpExtensionSource.ts";
+import { t3AgentInstructionsBlock } from "@t3tools/provider-core/server/orchestrationInstructions";
 import { loadMcpBridge } from "./mcpBridge.testkit.ts";
 import { turnItemOutputText } from "../../../client-runtime/src/work-log/itemDetail.ts";
 
@@ -518,6 +522,62 @@ const startTurn = Effect.fnUntraced(function* (
 });
 
 describe("PiAdapterV2", () => {
+  it.effect("keeps each session's agent definition file until that session closes", () =>
+    Effect.gen(function* () {
+      const fileSystem = yield* FileSystem.FileSystem;
+      const agentInstructions = t3AgentInstructionsBlock({
+        name: "reviewer",
+        path: "/repo/.claude/agents/reviewer.md",
+        instructions: "Check every changed line.",
+      });
+      const openWithAgent = Effect.fnUntraced(function* (providerSessionId: ProviderSessionId) {
+        const fake = yield* makeFakePi;
+        const { runtime } = yield* openRuntime(fake, "default", THREAD_ID, providerSessionId);
+        const providerThread = yield* runtime.ensureThread({
+          threadId: THREAD_ID,
+          modelSelection: modelSelection("default"),
+          runtimePolicy,
+        });
+        const path = fake.lastSpawn().env[T3_PI_AGENT_INSTRUCTIONS_PATH_ENV];
+        assert.isString(path);
+        assert.isFalse(yield* fileSystem.exists(path!));
+        yield* runtime.startTurn({
+          appThread: yield* makeAppThread("default"),
+          threadId: THREAD_ID,
+          runId: RunId.make(`run:agent:${providerSessionId}`),
+          runOrdinal: 1,
+          providerTurnOrdinal: 1,
+          attemptId: RunAttemptId.make(`run-attempt:agent:${providerSessionId}`),
+          rootNodeId: NodeId.make(`node:agent:${providerSessionId}`),
+          providerThread,
+          message: {
+            messageId: `message:${THREAD_ID}:${providerSessionId}` as never,
+            text: "Review the diff.",
+            attachments: [],
+            createdBy: "user",
+            creationSource: "web",
+          },
+          modelSelection: modelSelection("default"),
+          runtimePolicy,
+          agentInstructions,
+        });
+        yield* fake.takeRequest("prompt");
+        assert.equal(yield* fileSystem.readFileString(path!), agentInstructions);
+        return path!;
+      });
+
+      const firstScope = yield* Scope.make();
+      const first = yield* openWithAgent(ProviderSessionId.make("pi-agent-session-1")).pipe(
+        Scope.provide(firstScope),
+      );
+      const second = yield* openWithAgent(ProviderSessionId.make("pi-agent-session-2"));
+      yield* Scope.close(firstScope, Exit.void);
+
+      assert.isFalse(yield* fileSystem.exists(first));
+      assert.equal(yield* fileSystem.readFileString(second), agentInstructions);
+    }).pipe(Effect.scoped, Effect.provide(layerTest)),
+  );
+
   it.effect.each([false, true])(
     "completes a resumed user turn before native wake events arrive, Pi streaming=%s",
     (streaming) =>

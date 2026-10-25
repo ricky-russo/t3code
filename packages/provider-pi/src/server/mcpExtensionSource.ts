@@ -7,6 +7,7 @@ export const T3_MCP_URL_ENV = "T3_MCP_URL";
 export const T3_MCP_BEARER_ENV = "T3_MCP_BEARER_TOKEN";
 export const T3_PI_RUNTIME_MODE_ENV = "T3_PI_RUNTIME_MODE";
 export const T3_PI_MCP_EXTENSION_PATH_ENV = "T3_PI_MCP_EXTENSION_PATH";
+export const T3_PI_AGENT_INSTRUCTIONS_PATH_ENV = "T3_PI_AGENT_INSTRUCTIONS_PATH";
 
 // These tools trigger file-change approvals, bypassed by Auto-accept edits.
 export const PI_FILE_CHANGE_TOOLS = ["edit", "write"] as const;
@@ -21,6 +22,7 @@ const URL_ENV = ${JSON.stringify(T3_MCP_URL_ENV)};
 const TOKEN_ENV = ${JSON.stringify(T3_MCP_BEARER_ENV)};
 const RUNTIME_MODE_ENV = ${JSON.stringify(T3_PI_RUNTIME_MODE_ENV)};
 const EXTENSION_PATH_ENV = ${JSON.stringify(T3_PI_MCP_EXTENSION_PATH_ENV)};
+const AGENT_INSTRUCTIONS_PATH_ENV = ${JSON.stringify(T3_PI_AGENT_INSTRUCTIONS_PATH_ENV)};
 const ORCHESTRATION_INSTRUCTIONS = ${JSON.stringify(T3_CODE_ORCHESTRATION_INSTRUCTIONS.trim())};
 const PROTOCOL = "2025-06-18";
 const READ_ONLY_TOOLS = new Set(["read", "grep", "find", "ls"]);
@@ -448,16 +450,29 @@ export default async function t3McpExtension(pi: ExtensionAPI) {
     }
   });
 
+  // T3 writes the thread's agent definition to a file before each prompt; no file means no agent.
+  async function agentInstructions(): Promise<string> {
+    const path = env(AGENT_INSTRUCTIONS_PATH_ENV);
+    if (path === undefined) return "";
+    try {
+      return (await NodeFSP.readFile(path, "utf8")).trim();
+    } catch {
+      return "";
+    }
+  }
+
   // Keep guidance in the system prompt so leading slash commands still expand.
-  pi.on("before_agent_start", (event, ctx) => {
+  pi.on("before_agent_start", async (event, ctx) => {
     reconcileDiscovery(ctx);
+    const agent = await agentInstructions();
+    const guidance = agent === "" ? ORCHESTRATION_INSTRUCTIONS : ORCHESTRATION_INSTRUCTIONS + "\\n\\n" + agent;
     const sections = event.systemPromptOptions?.sections;
     if (sections && typeof sections === "object" && event.systemPromptOptions?.forceSystemPrompt === undefined) {
       // A full prompt override bypasses Pi's later section rendering.
-      sections.t3_code_orchestration = ORCHESTRATION_INSTRUCTIONS;
+      sections.t3_code_orchestration = guidance;
       return undefined;
     }
-    return { systemPrompt: event.systemPrompt + "\\n\\n" + ORCHESTRATION_INSTRUCTIONS };
+    return { systemPrompt: event.systemPrompt + "\\n\\n" + guidance };
   });
 }
 `;

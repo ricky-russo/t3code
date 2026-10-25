@@ -4,8 +4,9 @@ import { EnvironmentId, ProviderInstanceId, ThreadId } from "@t3tools/contracts"
 import {
   T3_MCP_BEARER_ENV,
   T3_MCP_URL_ENV,
-  T3_PI_RUNTIME_MODE_ENV,
+  T3_PI_AGENT_INSTRUCTIONS_PATH_ENV,
   T3_PI_MCP_EXTENSION_PATH_ENV,
+  T3_PI_RUNTIME_MODE_ENV,
 } from "./mcpExtensionSource.ts";
 import { buildPiRpcLaunch, resolvePiLaunchArgs } from "./mcpInjection.ts";
 
@@ -28,12 +29,14 @@ describe("pi T3 MCP injection", () => {
     );
     assert.isTrue(resolvedArgs.ok);
     if (!resolvedArgs.ok) return;
+    const agentInstructionsPath = "/tmp/t3-pi-agent-1/agent-instructions.md";
     const launch = buildPiRpcLaunch({
       launchArgs: resolvedArgs.args,
       environment: { PATH: "/usr/bin" },
       mcpSession,
       extensionPath: "/tmp/cache/pi-t3-mcp-extension.ts",
       runtimeMode: "approval-required",
+      agentInstructionsPath,
     });
     assert.deepEqual(launch.args, [
       "--mode",
@@ -59,6 +62,7 @@ describe("pi T3 MCP injection", () => {
     assert.equal(launch.env[T3_MCP_BEARER_ENV], "secret-pi-token");
     assert.equal(launch.env[T3_PI_RUNTIME_MODE_ENV], "approval-required");
     assert.equal(launch.env[T3_PI_MCP_EXTENSION_PATH_ENV], "/tmp/cache/pi-t3-mcp-extension.ts");
+    assert.equal(launch.env[T3_PI_AGENT_INSTRUCTIONS_PATH_ENV], agentInstructionsPath);
 
     const permissionOnly = buildPiRpcLaunch({
       launchArgs: [],
@@ -66,6 +70,7 @@ describe("pi T3 MCP injection", () => {
         [T3_MCP_URL_ENV]: "http://127.0.0.1:9999/stale",
         [T3_MCP_BEARER_ENV]: "stale-token",
         [T3_PI_MCP_EXTENSION_PATH_ENV]: "/stale/extension.ts",
+        [T3_PI_AGENT_INSTRUCTIONS_PATH_ENV]: "/stale/agent.md",
       },
       mcpSession: undefined,
       extensionPath: "/tmp/cache/pi-t3-mcp-extension.ts",
@@ -85,6 +90,7 @@ describe("pi T3 MCP injection", () => {
       permissionOnly.env[T3_PI_MCP_EXTENSION_PATH_ENV],
       "/tmp/cache/pi-t3-mcp-extension.ts",
     );
+    assert.isUndefined(permissionOnly.env[T3_PI_AGENT_INSTRUCTIONS_PATH_ENV]);
   });
 
   it("forces tools and user extensions off for unattended text generation", () => {
